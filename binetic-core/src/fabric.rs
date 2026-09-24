@@ -322,10 +322,45 @@ impl Fabric {
 
         let tier_id = {
             let tier_set = TierSet::new(self.config.tiers.clone());
-            tier_set.tier_for_layer(address.layer()).map(|t| t.id).unwrap_or(TierId::COLD)
+            tier_set
+                .tier_for_layer(address.layer())
+                .map(|t| t.id)
+                .unwrap_or(TierId::COLD)
         };
 
         let reg = self.registers.read().get(&address).cloned();
+
+        // If this register belongs to a delta model, resolve via base ^ delta
+        let reg = match reg {
+            Some(reg) => {
+                let models = self.models.read();
+                let delta_model = models.values().find(|m| m.is_delta && m.base_model_name.is_some()).cloned();
+                drop(models);
+                if let Some(model) = delta_model {
+                    let addr_bits = address.bits();
+                    let base_bits = model.base_address.bits();
+                    let end_bits = base_bits + model.weight_count as u128;
+                    if addr_bits >= base_bits && addr_bits < end_bits {
+                        let offset = (addr_bits - base_bits) as u128;
+                        let delta_addr_bits = base_bits + model.weight_count as u128 + offset;
+                        let delta_addr = RegisterAddress::from(delta_addr_bits);
+                        if let Some(delta_reg) = self.registers.read().get(&delta_addr) {
+                            let resolved_payload = BitslicedLane::xor(&reg.payload, &delta_reg.payload);
+                            let mut resolved = reg.clone();
+                            resolved.payload = resolved_payload;
+                            Some(resolved)
+                        } else {
+                            Some(reg)
+                        }
+                    } else {
+                        Some(reg)
+                    }
+                } else {
+                    Some(reg)
+                }
+            }
+            None => None,
+        };
         let latency_ms = start.elapsed().as_millis() as u64;
 
         if self.config.log_access {
@@ -522,7 +557,14 @@ impl Fabric {
         delta: BitslicedLane,
         purpose: EchoPurpose,
     ) -> Result<(), String> {
-        let reg = self.read(target_address).ok_or_else(|| "Target register not found".to_string())?;
+        // Read raw register directly, bypassing delta resolution, so the
+        // adaptation delta is applied to the base register only once.
+        let reg = self
+            .registers
+            .read()
+            .get(&target_address)
+            .cloned()
+            .ok_or_else(|| "Target register not found".to_string())?;
 
         let mut new_payload = reg.payload.clone();
         new_payload.xor_merge(&delta);
@@ -604,7 +646,41 @@ impl Fabric {
         Ok(model)
     }
 
-    /// Get a model attachment by name.
+    /// Attach a model as an XOR delta from a base model.
+    ///
+    /// The delta model stores XOR differences at offset addresses from the base.
+    /// When reading a delta register, the fabric computes: effective = base ^ delta.
+    pub fn attach_delta_model(
+        &self,
+        name: &str,
+        base_model_name: &str,
+    ) -> Result<ModelAttachment, String> {
+        let base_model = {
+            let models = self.models.read();
+            models
+                .get(base_model_name)
+                .ok_or_else(|| format!("Base model '{}' not found", base_model_name))?
+                .clone()
+        };
+
+        let model = ModelAttachment {
+            name: name.to_string(),
+            base_address: base_model.base_address,
+            weight_count: base_model.weight_count,
+            kv_cache_count: base_model.kv_cache_count,
+            tier: base_model.tier,
+            quantization: base_model.quantization,
+            is_delta: true,
+            base_model_name: Some(base_model_name.to_string()),
+        };
+
+        {
+            let mut models = self.models.write();
+            models.insert(name.to_string(), model.clone());
+        }
+
+        Ok(model)
+    }
     pub fn get_model(&self, name: &str) -> Option<ModelAttachment> {
         let models = self.models.read();
         models.get(name).cloned()
@@ -962,6 +1038,63 @@ mod tests {
     }
 
     #[test]
+    fn test_xor_delta_model_sharing_with_adaptation() {
+        let fabric = Fabric::new(FabricConfig::default()).expect("Failed to create fabric");
+        fabric.initialize().expect("Failed to initialize");
+
+        // Step 1: Attach base model
+        let base_model = fabric
+            .attach_model("base-v1", "", QuantizationLevel::Q4_0, false, None)
+            .unwrap();
+
+        // Step 2: Write base model weights into the fabric
+        let base_addr = base_model.base_address;
+        let base_payload = BitslicedLane::from_bits(&[true, false, true, false]);
+        fabric.write(base_addr, Register::new(base_addr, base_payload)).unwrap();
+
+        // Step 3: Attach delta model from base
+        let delta_model = fabric
+            .attach_delta_model("delta-v1", "base-v1")
+            .unwrap();
+        assert!(delta_model.is_delta);
+        assert_eq!(delta_model.base_model_name.as_deref(), Some("base-v1"));
+
+        // Step 4: Write delta register at offset address (XOR diff from base)
+        // base = [1,0,1,0], delta = [0,1,0,0] → effective = [1,1,1,0]
+        let base_bits = base_model.base_address.bits();
+        let delta_bits = base_bits + delta_model.weight_count as u128;
+        let delta_addr = RegisterAddress::from(delta_bits);
+        let delta_payload = BitslicedLane::from_bits(&[false, true, false, false]);
+        fabric.write(delta_addr, Register::new(delta_addr, delta_payload)).unwrap();
+
+        // Step 5: Read via delta model — should resolve base ^ delta
+        let resolved = fabric.read(base_addr).unwrap();
+        // base ^ delta = [1^0, 0^1, 1^0, 0^0] = [1, 1, 1, 0]
+        assert_eq!(resolved.payload.get_bit(0), true);
+        assert_eq!(resolved.payload.get_bit(1), true);
+        assert_eq!(resolved.payload.get_bit(2), true);
+        assert_eq!(resolved.payload.get_bit(3), false);
+
+        // Step 6: Inject adaptation delta into the delta model
+        let adapt_delta = BitslicedLane::from_bits(&[false, false, true, false]);
+        fabric
+            .inject_adapt(base_addr, adapt_delta, EchoPurpose::WeightUpdate)
+            .unwrap();
+
+        // Step 7: Read after adaptation — effective = base ^ delta ^ adapt_delta
+        let adapted = fabric.read(base_addr).unwrap();
+        // base ^ delta ^ adapt = [1,1,1,0] ^ [0,0,1,0] = [1,1,0,0]
+        assert_eq!(adapted.payload.get_bit(0), true);
+        assert_eq!(adapted.payload.get_bit(1), true);
+        assert_eq!(adapted.payload.get_bit(2), false);
+        assert_eq!(adapted.payload.get_bit(3), false);
+
+        // Stats verify
+        let stats = fabric.stats();
+        assert_eq!(stats.adaptation_deltas_injected, 1);
+    }
+
+    #[test]
     fn test_fabric_rotation_advance() {
         let fabric = Fabric::new(FabricConfig::default()).expect("Failed to create fabric");
         fabric.initialize().expect("Failed to initialize");
@@ -1102,7 +1235,10 @@ mod tests {
             BitslicedLane::from_bits(&[false, true]),
         );
 
-        let compound = CompoundRegister::new(CombiningMethod::Sequential, &[base0, base1]);
+        let b0 = base0.clone();
+        let b1 = base1.clone();
+
+        let compound = CompoundRegister::new(CombiningMethod::Sequential, &[b0, b1]);
 
         assert_eq!(compound.base_count, 2);
         assert_eq!(compound.precision_bits, 128);

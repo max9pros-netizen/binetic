@@ -721,8 +721,10 @@ mod compound_tests {
             RegisterAddress::new(0, 1, 0, 0, 1, 0),
             BitslicedLane::from_bits(&[false]),
         );
+        let b0 = base0.clone();
+        let b1 = base1.clone();
 
-        let compound = CompoundRegister::new(CombiningMethod::XorChain, &[base0, base1]);
+        let compound = CompoundRegister::new(CombiningMethod::XorChain, &[b0, b1]);
 
         let lookup = |addr: RegisterAddress| -> Option<Register> {
             if addr == base0.address {
@@ -741,7 +743,7 @@ mod compound_tests {
     fn test_record_creation() {
         let fields = vec![
             ("id".to_string(), BitslicedLane::from_bytes(&[42])),
-            ("name".to_string(), BitslicedLane::from_bytes(&["Alice".as_bytes()])),
+            ("name".to_string(), BitslicedLane::from_bytes("Alice".as_bytes())),
             ("age".to_string(), BitslicedLane::from_bytes(&[30])),
         ];
 

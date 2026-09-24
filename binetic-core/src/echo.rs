@@ -322,6 +322,7 @@ mod tests {
 
     #[test]
     fn test_echo_propagation_basic() {
+        use std::cell::RefCell;
         use std::collections::HashMap;
 
         let policy = EchoPolicy::default();
@@ -329,7 +330,7 @@ mod tests {
         let mut propagator = EchoPropagator::new(policy, bloom_registry);
 
         // Set up a simple register "database"
-        let mut registers: HashMap<RegisterAddress, Register> = HashMap::new();
+        let registers = RefCell::new(HashMap::<RegisterAddress, Register>::new());
 
         let addr_a = RegisterAddress::new(0, 1, 2, 3, 0, 0);
         let addr_b = RegisterAddress::new(0, 1, 2, 3, 1, 0); // dependent of A
@@ -337,8 +338,8 @@ mod tests {
         let payload_a = BitslicedLane::from_bits(&[true, false, true, false]);
         let payload_b = BitslicedLane::from_bits(&[false, true, false, true]);
 
-        registers.insert(addr_a, Register::new(addr_a, payload_a));
-        registers.insert(addr_b, Register::new(addr_b, payload_b));
+        registers.borrow_mut().insert(addr_a, Register::new(addr_a, payload_a));
+        registers.borrow_mut().insert(addr_b, Register::new(addr_b, payload_b));
 
         // Queue an echo from A
         let delta = BitslicedLane::from_bits(&[true, false, false, false]);
@@ -346,9 +347,9 @@ mod tests {
 
         // Propagate
         let stats = propagator.propagate(
-            |addr| registers.get(&addr).cloned(),
+            |addr| registers.borrow().get(&addr).cloned(),
             |addr, delta| {
-                if let Some(mut reg) = registers.get_mut(&addr) {
+                if let Some(mut reg) = registers.borrow_mut().get_mut(&addr) {
                     reg.update_with_delta(&delta);
                 }
             },
@@ -366,7 +367,7 @@ mod tests {
         assert!(stats.canceled == 0);
 
         // Check that B was updated
-        let reg_b = registers.get(&addr_b).unwrap();
+        let reg_b = registers.borrow().get(&addr_b).cloned().unwrap();
         // B's original payload was [false, true, false, true]
         // Delta was [true, false, false, false]
         // After XOR: [true, true, false, true]

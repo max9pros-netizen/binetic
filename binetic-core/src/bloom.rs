@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn test_false_positive_rate() {
-        let bloom = SectorBloom::new(1024, 3, 0xDEADBEEF);
+        let mut bloom = SectorBloom::new(1024, 3, 0xDEADBEEF);
 
         // Insert 100 elements
         for i in 0..100 {

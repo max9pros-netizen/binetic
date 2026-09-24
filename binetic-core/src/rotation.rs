@@ -397,6 +397,7 @@ impl fmt::Display for RotationScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Tier, EchoPolicy};
 
     #[test]
     fn test_rotation_scheduler_creation() {
