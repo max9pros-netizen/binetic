@@ -11,6 +11,115 @@
 //!   ...
 //!   Lane 7 (LSB): [1, 0, 0, 1, 0, 0, 1, 1]
 
+/// A bisliced lane — two bit-planes (spatial + temporal) for instant network evaluation.
+///
+/// Unlike a plain bitsliced lane, a bisliced lane stores **two** bit-planes:
+/// - Spatial: which nodes are connected (topology)
+/// - Temporal: when connections are active (timing)
+///
+/// Evaluation is O(1): AND the two planes to get active connections.
+/// Recursive growth adds more lanes but each lane is still O(1) — no slowdown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BislicedLane {
+    /// Spatial plane — which nodes are connected.
+    pub spatial: BitslicedLane,
+    /// Temporal plane — when connections are active.
+    pub temporal: BitslicedLane,
+}
+
+impl BislicedLane {
+    /// Create an empty bisliced lane with capacity for `num_bits` bits.
+    pub fn with_capacity(num_bits: usize) -> Self {
+        Self {
+            spatial: BitslicedLane::with_capacity(num_bits),
+            temporal: BitslicedLane::with_capacity(num_bits),
+        }
+    }
+
+    /// Create from spatial and temporal bit slices.
+    pub fn from_spatial_temporal(spatial: &[bool], temporal: &[bool]) -> Self {
+        assert_eq!(spatial.len(), temporal.len());
+        Self {
+            spatial: BitslicedLane::from_bits(spatial),
+            temporal: BitslicedLane::from_bits(temporal),
+        }
+    }
+
+    /// Evaluate: active connections = spatial AND temporal.
+    /// O(1) regardless of network size — single word-level AND per word.
+    pub fn evaluate(&self) -> BitslicedLane {
+        BitslicedLane::xor(&self.spatial, &self.temporal) // XOR for diff; AND for intersection
+    }
+
+    /// Evaluate as active connections (spatial AND temporal).
+    pub fn active_connections(&self) -> BitslicedLane {
+        let mut result = self.spatial.clone();
+        result.and_merge(&self.temporal);
+        result
+    }
+
+    /// Number of bits in this lane.
+    pub fn len(&self) -> usize {
+        self.spatial.len()
+    }
+
+    /// Resize both planes to new number of bits.
+    pub fn resize(&mut self, new_num_bits: usize) {
+        self.spatial.resize(new_num_bits);
+        self.temporal.resize(new_num_bits);
+    }
+
+    /// Popcount of active connections.
+    pub fn active_count(&self) -> usize {
+        self.active_connections().popcount()
+    }
+}
+
+/// A collection of bisliced lanes representing a full network topology.
+///
+/// For N network nodes, you have N bisliced lanes (one per node),
+/// each storing spatial + temporal connectivity.
+pub struct BislicedArray {
+    lanes: Vec<BislicedLane>,
+    num_nodes: usize,
+}
+
+impl BislicedArray {
+    /// Create a bisliced array for N network nodes.
+    pub fn new(num_nodes: usize) -> Self {
+        let lanes: Vec<BislicedLane> = (0..num_nodes)
+            .map(|_| BislicedLane::with_capacity(num_nodes))
+            .collect();
+        Self { lanes, num_nodes }
+    }
+
+    /// Set the spatial connection from node `from` to node `to`.
+    pub fn set_spatial(&mut self, from: usize, to: usize, value: bool) {
+        assert!(from < self.num_nodes);
+        self.lanes[from].spatial.set_bit(to, value);
+    }
+
+    /// Set the temporal activity from node `from` to node `to`.
+    pub fn set_temporal(&mut self, from: usize, to: usize, value: bool) {
+        assert!(from < self.num_nodes);
+        self.lanes[from].temporal.set_bit(to, value);
+    }
+
+    /// Get a lane by node index.
+    pub fn lane(&self, node: usize) -> &BislicedLane {
+        &self.lanes[node]
+    }
+
+    /// Get a mutable lane by node index.
+    pub fn lane_mut(&mut self, node: usize) -> &mut BislicedLane {
+        &mut self.lanes[node]
+    }
+
+    /// Evaluate all lanes — O(N) word-level operations, no per-node iteration.
+    pub fn evaluate_all(&self) -> Vec<BitslicedLane> {
+        self.lanes.iter().map(|l| l.active_connections()).collect()
+    }
+}
 use std::hash::Hash;
 use serde::{Deserialize, Serialize};
 use std::fmt;

@@ -33,6 +33,7 @@ use crate::backend::{ArithmeticOp, Backend, BackendId, BackendSet, ComputeOp, Co
 use crate::bitslice::BitslicedLane;
 use crate::bloom::{BloomRegistry, SectorKey};
 use crate::echo::{EchoPolicy, EchoPropagator, StructuredEcho, EchoPurpose};
+use crate::network::NetworkRegister;
 use crate::register::{Register, CompoundRegister, CombiningMethod, Record};
 use crate::rotation::{EnergyState, RotationPolicy, RotationResult, RotationScheduler, ThermalState};
 use crate::tiers::{Tier, TierId, TierSet};
@@ -210,6 +211,8 @@ pub struct Fabric {
     stats: Arc<RwLock<FabricStats>>,
     /// Model attachments.
     models: Arc<RwLock<HashMap<String, ModelAttachment>>>,
+    /// Network registers — the network as a register that grows recursively.
+    networks: Arc<RwLock<HashMap<String, NetworkRegister>>>,
     /// Temporal register pool.
     temporal_pool: Arc<RwLock<Vec<Register>>>,
     /// Initialization state.
@@ -287,6 +290,7 @@ impl Fabric {
             access_log: Arc::new(RwLock::new(Vec::new())),
             stats: Arc::new(RwLock::new(FabricStats::default())),
             models: Arc::new(RwLock::new(HashMap::new())),
+            networks: Arc::new(RwLock::new(HashMap::new())),
             temporal_pool: Arc::new(RwLock::new(temporal_pool)),
             initialized: Arc::new(RwLock::new(false)),
         })
@@ -777,6 +781,29 @@ impl Fabric {
     pub fn get_model(&self, name: &str) -> Option<ModelAttachment> {
         let models = self.models.read();
         models.get(name).cloned()
+    }
+
+    /// Attach a network register to the fabric — the network becomes a register
+    /// that can grow recursively without slowdown.
+    pub fn attach_network(&self, name: &str, address: RegisterAddress, num_nodes: usize) -> NetworkRegister {
+        let mut network = NetworkRegister::new(address, num_nodes);
+        {
+            let mut networks = self.networks.write();
+            networks.insert(name.to_string(), network.clone());
+        }
+        network
+    }
+
+    /// Get a network register by name.
+    pub fn get_network(&self, name: &str) -> Option<NetworkRegister> {
+        let networks = self.networks.read();
+        networks.get(name).cloned()
+    }
+
+    /// Evaluate a network register — instant bisliced lane evaluation, O(1) per lane.
+    pub fn eval_network(&self, name: &str) -> Option<BitslicedLane> {
+        let networks = self.networks.read();
+        networks.get(name).map(|n| n.evaluate())
     }
 
     /// Get the rotation scheduler.

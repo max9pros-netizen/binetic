@@ -12,6 +12,7 @@
 //! - Energy is a first-class scheduling concern.
 
 pub mod address;
+pub mod network;
 pub mod register;
 pub mod tiers;
 pub mod bloom;
@@ -22,10 +23,11 @@ pub mod fabric;
 pub mod backend;
 
 pub use address::RegisterAddress;
+pub use network::NetworkRegister;
 pub use register::Register;
 pub use tiers::{Tier, TierId, RamTier, MmapTier};
 pub use bloom::SectorBloom;
-pub use bitslice::BitslicedLane;
+pub use bitslice::{BislicedArray, BislicedLane};
 pub use rotation::RotationScheduler;
 pub use echo::{EchoPolicy, EchoPropagator};
 pub use fabric::Fabric;
