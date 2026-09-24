@@ -388,6 +388,78 @@ impl Fabric {
         reg
     }
 
+    /// Read a register bypassing delta resolution — returns the raw stored value.
+    /// Use this when you need the base register as-is, without XOR delta applied.
+    pub fn read_raw(&self, address: RegisterAddress) -> Option<Register> {
+        let start = Instant::now();
+
+        let tier_id = {
+            let tier_set = TierSet::new(self.config.tiers.clone());
+            tier_set
+                .tier_for_layer(address.layer())
+                .map(|t| t.id)
+                .unwrap_or(TierId::COLD)
+        };
+
+        let reg = self.registers.read().get(&address).cloned();
+
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        if self.config.log_access {
+            let mut log = self.access_log.write();
+            log.push(AccessEntry {
+                timestamp: start.elapsed().as_millis() as u64,
+                address,
+                operation: AccessOperation::Read,
+                latency_ms,
+                tier_id,
+            });
+        }
+
+        {
+            let mut stats = self.stats.write();
+            stats.total_reads += 1;
+            *stats.register_count_by_tier.entry(tier_id).or_insert(0) += 1;
+        }
+
+        {
+            let mut scheduler = self.rotation_scheduler.write();
+            scheduler.record_access(address.layer());
+        }
+
+        reg
+    }
+
+    /// Explicitly resolve deltas for a register — base ^ delta at offset address.
+    /// Returns None if no delta model is attached or no delta register exists.
+    pub fn resolve(&self, address: RegisterAddress) -> Option<Register> {
+        let reg = self.registers.read().get(&address).cloned();
+        let reg = reg?;
+
+        let models = self.models.read();
+        let delta_model = models.values().find(|m| m.is_delta && m.base_model_name.is_some()).cloned();
+        drop(models);
+
+        if let Some(model) = delta_model {
+            let addr_bits = address.bits();
+            let base_bits = model.base_address.bits();
+            let end_bits = base_bits + model.weight_count as u128;
+            if addr_bits >= base_bits && addr_bits < end_bits {
+                let offset = (addr_bits - base_bits) as u128;
+                let delta_addr_bits = base_bits + model.weight_count as u128 + offset;
+                let delta_addr = RegisterAddress::from(delta_addr_bits);
+                if let Some(delta_reg) = self.registers.read().get(&delta_addr) {
+                    let resolved_payload = BitslicedLane::xor(&reg.payload, &delta_reg.payload);
+                    let mut resolved = reg.clone();
+                    resolved.payload = resolved_payload;
+                    return Some(resolved);
+                }
+            }
+        }
+
+        Some(reg)
+    }
+
     /// Write a register to the fabric.
     pub fn write(&self, address: RegisterAddress, mut register: Register) -> Result<(), String> {
         let start = Instant::now();
@@ -612,6 +684,27 @@ impl Fabric {
             stats.adaptation_deltas_injected += 1;
         }
 
+        Ok(())
+    }
+
+    /// Inject an adaptation delta into a raw register — bypasses delta resolution
+    /// and skips echo propagation. Use this when you need full control over
+    /// when and how deltas are applied (e.g., GA-driven adaptation where the
+    /// caller manages the propagation schedule).
+    pub fn inject_adapt_raw(
+        &self,
+        target_address: RegisterAddress,
+        delta: BitslicedLane,
+    ) -> Result<(), String> {
+        {
+            let mut registers = self.registers.write();
+            let reg = registers.get(&target_address).cloned()
+                .ok_or_else(|| "Target register not found".to_string())?;
+            let mut updated = reg.clone();
+            // update_with_delta already XOR-merges the payload — no separate xor_merge needed
+            updated.update_with_delta(&delta);
+            registers.insert(target_address, updated);
+        }
         Ok(())
     }
 
@@ -1248,5 +1341,47 @@ mod tests {
             else if addr == base1.address { Some(base1.clone()) }
             else { None }
         }));
+    }
+
+    #[test]
+    fn test_raw_vs_resolved_read() {
+        let fabric = Fabric::new(FabricConfig::default()).expect("Failed to create fabric");
+        fabric.initialize().expect("Failed to initialize");
+
+        // Write a base register
+        let addr = RegisterAddress::new(0, 1, 0, 0, 0, 0);
+        let base_payload = BitslicedLane::from_bits(&[true, false, true, false]);
+        fabric.write(addr, Register::new(addr, base_payload.clone())).unwrap();
+
+        // read_raw returns the raw value
+        let raw = fabric.read_raw(addr).unwrap();
+        assert_eq!(raw.payload.get_bit(0), true);
+        assert_eq!(raw.payload.get_bit(1), false);
+
+        // resolve without a delta model returns the raw value
+        let resolved = fabric.resolve(addr).unwrap();
+        assert_eq!(resolved.payload.get_bit(0), true);
+    }
+
+    #[test]
+    fn test_inject_adapt_raw() {
+        let fabric = Fabric::new(FabricConfig::default()).expect("Failed to create fabric");
+        fabric.initialize().expect("Failed to initialize");
+
+        let addr = RegisterAddress::new(0, 1, 0, 0, 0, 0);
+        let base_payload = BitslicedLane::from_bits(&[true, false, true, false]);
+        fabric.write(addr, Register::new(addr, base_payload)).unwrap();
+
+        // Apply delta via inject_adapt_raw — no echo propagation, no delta resolution
+        let delta = BitslicedLane::from_bits(&[false, true, false, false]);
+        fabric.inject_adapt_raw(addr, delta).unwrap();
+
+        // read_raw returns the raw value with delta XOR-applied directly
+        let raw = fabric.read_raw(addr).unwrap();
+        // [true,false,true,false] XOR [false,true,false,false] = [true,true,true,false]
+        assert_eq!(raw.payload.get_bit(0), true);
+        assert_eq!(raw.payload.get_bit(1), true);
+        assert_eq!(raw.payload.get_bit(2), true);
+        assert_eq!(raw.payload.get_bit(3), false);
     }
 }
