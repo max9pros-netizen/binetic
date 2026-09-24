@@ -223,6 +223,14 @@ impl Backend for LlamaCppBackend {
             ArithmeticOp::RoPE,
             ArithmeticOp::SiLU,
             ArithmeticOp::GELU,
+            // Trigonometric logic gates
+            ArithmeticOp::Sin,
+            ArithmeticOp::Cos,
+            ArithmeticOp::XorGate,
+            ArithmeticOp::AndGate,
+            ArithmeticOp::OrGate,
+            ArithmeticOp::NotGate,
+            ArithmeticOp::Hadamard,
             ArithmeticOp::SampleNextToken,
         ]
     }

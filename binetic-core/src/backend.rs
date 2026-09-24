@@ -66,6 +66,21 @@ pub enum ArithmeticOp {
     QuantizedMatMul,
     /// Sample next token from logits
     SampleNextToken,
+    /// ── Trigonometric logic gates ──
+    /// sin(x): continuous logic, bridges Boolean and analog computation
+    Sin,
+    /// cos(x): continuous logic complement to Sin
+    Cos,
+    /// XOR via trig identity: sin(A·π/2)·cos(B·π/2) + cos(A·π/2)·sin(B·π/2)
+    XorGate,
+    /// AND via trig: sin(A·π/2)·sin(B·π/2), both high → high
+    AndGate,
+    /// OR via trig: 1 - cos(A·π/2)·cos(B·π/2), either high → high
+    OrGate,
+    /// NOT via trig: cos(A·π/2), inverts 0↔1 smoothly
+    NotGate,
+    /// Hadamard (circular correlation): cos(A-B) = cosA·cosB + sinA·sinB
+    Hadamard,
     /// Custom operation (backend-specific)
     Custom(u32),
 }
@@ -85,6 +100,13 @@ impl fmt::Display for ArithmeticOp {
             ArithmeticOp::GELU => write!(f, "GELU"),
             ArithmeticOp::QuantizedMatMul => write!(f, "QuantMatMul"),
             ArithmeticOp::SampleNextToken => write!(f, "SampleNextToken"),
+            ArithmeticOp::Sin => write!(f, "Sin"),
+            ArithmeticOp::Cos => write!(f, "Cos"),
+            ArithmeticOp::XorGate => write!(f, "XorGate"),
+            ArithmeticOp::AndGate => write!(f, "AndGate"),
+            ArithmeticOp::OrGate => write!(f, "OrGate"),
+            ArithmeticOp::NotGate => write!(f, "NotGate"),
+            ArithmeticOp::Hadamard => write!(f, "Hadamard"),
             ArithmeticOp::Custom(id) => write!(f, "Custom({})", id),
         }
     }
@@ -380,6 +402,14 @@ impl Backend for NativeBackend {
             ArithmeticOp::MatMul,
             ArithmeticOp::SiLU,
             ArithmeticOp::GELU,
+            // Trigonometric logic gates
+            ArithmeticOp::Sin,
+            ArithmeticOp::Cos,
+            ArithmeticOp::XorGate,
+            ArithmeticOp::AndGate,
+            ArithmeticOp::OrGate,
+            ArithmeticOp::NotGate,
+            ArithmeticOp::Hadamard,
         ]
     }
 
@@ -491,24 +521,103 @@ impl Backend for NativeBackend {
                 }
             }
             ArithmeticOp::GELU => {
-                // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-                // In bitsliced domain, approximate as: if MSB is 1, keep; if 0, zero out
-                // (similar to SiLU but with slightly different threshold).
-                if let Some(op0) = operands.first() {
-                    let mut r = op0.clone();
-                    let n = op0.len();
-                    if n > 0 {
-                        let msb = op0.get_bit(n - 1);
-                        if !msb {
-                            let zero = BitslicedLane::with_capacity(n);
-                            r.and_merge(&zero);
+                            // GELU approximation: 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
+                            // In bitsliced domain, approximate as: if MSB is 1, keep; if 0, zero out
+                            if let Some(op0) = operands.first() {
+                                let mut r = op0.clone();
+                                let n = op0.len();
+                                if n > 0 {
+                                    let msb = op0.get_bit(n - 1);
+                                    if !msb {
+                                        let zero = BitslicedLane::with_capacity(n);
+                                        r.and_merge(&zero);
+                                    }
+                                }
+                                r
+                            } else {
+                                BitslicedLane::default()
+                            }
                         }
-                    }
-                    r
-                } else {
-                    BitslicedLane::default()
-                }
-            }
+                        // ── Trigonometric logic gates ──
+                        // For bits: map 0→0, 1→π/2. Then:
+                        //   sin(x·π/2):  0→0, 1→1  (identity)
+                        //   cos(x·π/2):  0→1, 1→0  (NOT)
+                        //   sin(A+B):     XOR for Boolean {0,π/2}
+                        //   sin(A)·sin(B): AND
+                        //   1-cos(A)·cos(B): OR
+                        //   cos(A-B):     Hadamard/correlation
+                        ArithmeticOp::Sin => {
+                            // sin(x·π/2) = x for x∈{0,1} — identity in Boolean domain
+                            operands.first().cloned().unwrap_or_default()
+                        }
+                        ArithmeticOp::Cos => {
+                            // cos(x·π/2) = NOT(x) for x∈{0,1} — bitwise NOT
+                            let mut r = operands.first().cloned().unwrap_or_default();
+                            r.not_inplace();
+                            r
+                        }
+                        ArithmeticOp::XorGate => {
+                            // sin(A·π/2+B·π/2) = sin(A·π/2)cos(B·π/2) + cos(A·π/2)sin(B·π/2)
+                            // For Boolean: sin(A+B) = XOR(A,B)
+                            if operands.len() >= 2 {
+                                let a = &operands[0];
+                                let b = &operands[1];
+                                let mut r = a.clone();
+                                r.xor_merge(b);
+                                r
+                            } else {
+                                BitslicedLane::default()
+                            }
+                        }
+                        ArithmeticOp::AndGate => {
+                            // sin(A·π/2)·sin(B·π/2) = AND(A,B) for Boolean
+                            if operands.len() >= 2 {
+                                let mut r = operands[0].clone();
+                                r.and_merge(&operands[1]);
+                                r
+                            } else {
+                                BitslicedLane::default()
+                            }
+                        }
+                        ArithmeticOp::OrGate => {
+                            // 1 - cos(A·π/2)·cos(B·π/2) = OR(A,B) for Boolean
+                            if operands.len() >= 2 {
+                                let a = &operands[0];
+                                let b = &operands[1];
+                                // OR = NOT(NAND) = NOT(AND(NOT(A), NOT(B)))
+                                let mut na = a.clone();
+                                na.not_inplace();
+                                let mut nb = b.clone();
+                                nb.not_inplace();
+                                let mut nand = na.clone();
+                                nand.and_merge(&nb);
+                                nand.not_inplace();
+                                nand
+                            } else {
+                                BitslicedLane::default()
+                            }
+                        }
+                        ArithmeticOp::NotGate => {
+                            // cos(x·π/2) = NOT(x) for Boolean
+                            let mut r = operands.first().cloned().unwrap_or_default();
+                            r.not_inplace();
+                            r
+                        }
+                        ArithmeticOp::Hadamard => {
+                            // cos(A-B) = cosA·cosB + sinA·sinB — circular correlation
+                            // For Boolean: cos(A·π/2-B·π/2) = 1 if A==B, 0 if A≠B (XNOR)
+                            if operands.len() >= 2 {
+                                let a = &operands[0];
+                                let b = &operands[1];
+                                // XNOR = NOT(XOR)
+                                let mut r = a.clone();
+                                r.xor_merge(b);
+                                r.not_inplace();
+                                r
+                            } else {
+                                BitslicedLane::default()
+                            }
+                        }
             _ => {
                 return ComputeResult {
                     success: false,
@@ -596,5 +705,70 @@ mod tests {
         assert_eq!(set.len(), 1);
         assert!(set.get(BackendId::NATIVE).is_some());
         assert!(set.get(BackendId::LLAMA_CPP).is_none());
+    }
+
+    #[test]
+    fn test_trig_logic_gates() {
+        let backend = NativeBackend::new();
+        let a = BitslicedLane::from_bits(&[true, false, true, false]);
+        let b = BitslicedLane::from_bits(&[false, true, true, false]);
+
+        // Sin = identity
+        let op_sin = ComputeOp::new(ArithmeticOp::Sin, vec![], RegisterAddress::zero());
+        let mut res_sin = backend.execute(&op_sin, &[a.clone()]);
+        assert!(res_sin.success);
+        assert_eq!(res_sin.payload.as_mut().unwrap().get_bit(0), true);
+        assert_eq!(res_sin.payload.as_mut().unwrap().get_bit(1), false);
+
+        // Cos = NOT
+        let op_cos = ComputeOp::new(ArithmeticOp::Cos, vec![], RegisterAddress::zero());
+        let mut res_cos = backend.execute(&op_cos, &[a.clone()]);
+        assert!(res_cos.success);
+        assert_eq!(res_cos.payload.as_mut().unwrap().get_bit(0), false);
+        assert_eq!(res_cos.payload.as_mut().unwrap().get_bit(1), true);
+
+        // XorGate = XOR
+        let op_xor = ComputeOp::new(ArithmeticOp::XorGate, vec![], RegisterAddress::zero());
+        let mut res_xor = backend.execute(&op_xor, &[a.clone(), b.clone()]);
+        assert!(res_xor.success);
+        assert_eq!(res_xor.payload.as_mut().unwrap().get_bit(0), true);
+        assert_eq!(res_xor.payload.as_mut().unwrap().get_bit(1), true);
+        assert_eq!(res_xor.payload.as_mut().unwrap().get_bit(2), false);
+        assert_eq!(res_xor.payload.as_mut().unwrap().get_bit(3), false);
+
+        // AndGate = AND
+        let op_and = ComputeOp::new(ArithmeticOp::AndGate, vec![], RegisterAddress::zero());
+        let mut res_and = backend.execute(&op_and, &[a.clone(), b.clone()]);
+        assert!(res_and.success);
+        assert_eq!(res_and.payload.as_mut().unwrap().get_bit(0), false);
+        assert_eq!(res_and.payload.as_mut().unwrap().get_bit(1), false);
+        assert_eq!(res_and.payload.as_mut().unwrap().get_bit(2), true);
+        assert_eq!(res_and.payload.as_mut().unwrap().get_bit(3), false);
+
+        // OrGate = OR
+        let op_or = ComputeOp::new(ArithmeticOp::OrGate, vec![], RegisterAddress::zero());
+        let mut res_or = backend.execute(&op_or, &[a.clone(), b.clone()]);
+        assert!(res_or.success);
+        assert_eq!(res_or.payload.as_mut().unwrap().get_bit(0), true);
+        assert_eq!(res_or.payload.as_mut().unwrap().get_bit(1), true);
+        assert_eq!(res_or.payload.as_mut().unwrap().get_bit(2), true);
+        assert_eq!(res_or.payload.as_mut().unwrap().get_bit(3), false);
+
+        // NotGate = NOT
+        let op_not = ComputeOp::new(ArithmeticOp::NotGate, vec![], RegisterAddress::zero());
+        let mut res_not = backend.execute(&op_not, &[a.clone()]);
+        assert!(res_not.success);
+        assert_eq!(res_not.payload.as_mut().unwrap().get_bit(0), false);
+        assert_eq!(res_not.payload.as_mut().unwrap().get_bit(1), true);
+
+        // Hadamard = XNOR
+        let op_hadamard = ComputeOp::new(ArithmeticOp::Hadamard, vec![], RegisterAddress::zero());
+        let mut res_hadamard = backend.execute(&op_hadamard, &[a.clone(), b.clone()]);
+        assert!(res_hadamard.success);
+        let p = res_hadamard.payload.as_mut().unwrap();
+        assert_eq!(p.get_bit(0), false);
+        assert_eq!(p.get_bit(1), false);
+        assert_eq!(p.get_bit(2), true);
+        assert_eq!(p.get_bit(3), true);
     }
 }
