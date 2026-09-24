@@ -17,6 +17,9 @@ use binetic_core::{
     bitslice::BitslicedLane,
     address::RegisterAddress,
 };
+use binetic_intent::{
+    IntentEngine, IntentEngineConfig, Intent, UserAuthority, Verifier, TrajectoryOutcome,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use std::path::PathBuf;
@@ -54,8 +57,52 @@ enum Commands {
     Benchmark(BenchmarkCmd),
     /// Inject an adaptation delta.
     Adapt(AdaptCmd),
+    /// Detect and evolve toward user intent.
+    Intent(IntentCmd),
+    /// Verify a mutation against the verifier gates.
+    Verify(VerifyCmd),
     /// Generate a default configuration file.
     Init,
+}
+
+/// Detect and evolve toward user intent from natural language.
+#[derive(Parser, Debug)]
+struct IntentCmd {
+    /// Natural language description of what you want the system to do.
+    #[arg(short, long)]
+    description: String,
+
+    /// Current register state (hex bits, e.g. "0101").
+    #[arg(short, long, default_value = "0000")]
+    current_state: String,
+
+    /// Target operation (sin, cos, xor, and, or, not, hadamard).
+    #[arg(short, long)]
+    target_op: Option<String>,
+
+    /// Population size for GA evolution.
+    #[arg(long, default_value = "20")]
+    population: usize,
+
+    /// Max generations to evolve.
+    #[arg(long, default_value = "10")]
+    generations: u64,
+}
+
+/// Verify a mutation against the verifier gates.
+#[derive(Parser, Debug)]
+struct VerifyCmd {
+    /// Delta hash (u64) of the proposed mutation.
+    #[arg(short, long)]
+    delta_hash: u64,
+
+    /// Intent hash (u64) of the user's confirmed intent.
+    #[arg(short, long)]
+    intent_hash: u64,
+
+    /// Features for scoring model (comma-separated floats).
+    #[arg(short, long, default_value = "0.5,0.5,0.5,0.5")]
+    features: String,
 }
 
 #[derive(Parser, Debug)]
@@ -205,6 +252,8 @@ fn main() {
         Commands::Stats => run_stats(),
         Commands::Benchmark(cmd) => run_benchmark(cmd),
         Commands::Adapt(cmd) => run_adapt(cmd),
+        Commands::Intent(cmd) => run_intent(cmd),
+        Commands::Verify(cmd) => run_verify(cmd),
         Commands::Init => run_init(),
     }
 }
@@ -572,6 +621,120 @@ fn run_adapt(cmd: AdaptCmd) {
             error!("Failed to inject adaptation: {}", e);
         }
     }
+}
+
+/// Adapter wrapping the real Fabric for the intent engine.
+struct FabricAdapterImpl {
+    fabric: Arc<Fabric>,
+}
+
+impl binetic_intent::FabricAdapter for FabricAdapterImpl {
+    fn read_raw(&self, addr: RegisterAddress) -> Option<binetic_core::register::Register> {
+        self.fabric.read_raw(addr)
+    }
+
+    fn write(&self, addr: RegisterAddress, reg: binetic_core::register::Register) -> Result<(), String> {
+        self.fabric.write(addr, reg)
+    }
+
+    fn inject_adapt_raw(&self, addr: RegisterAddress, delta: BitslicedLane) -> Result<(), String> {
+        self.fabric.inject_adapt_raw(addr, delta)
+    }
+}
+
+fn run_intent(cmd: IntentCmd) {
+    let config = FabricConfig::default();
+    let fabric = Arc::new(Fabric::new(config).expect("Failed to create fabric"));
+    fabric.initialize().expect("Failed to initialize fabric");
+
+    let intent_engine_config = IntentEngineConfig {
+        population_size: cmd.population,
+        max_generations: cmd.generations,
+        fitness_threshold: 0.01,
+        meta_learning_enabled: true,
+        gene_length: 64,
+    };
+
+    let fabric_adapter = Arc::new(FabricAdapterImpl { fabric: fabric.clone() });
+    let mut engine = IntentEngine::new(fabric_adapter, intent_engine_config);
+
+    // Parse current state from hex string
+    let current_bits: Vec<bool> = cmd.current_state.chars().map(|c| c == '1').collect();
+    let current_state = BitslicedLane::from_bits(&current_bits);
+
+    // Detect intent from description
+    let mut intent = engine.detect_intent(&cmd.description).unwrap_or_else(|e| {
+        error!("Failed to detect intent: {}", e);
+        std::process::exit(1);
+    });
+
+    // Override target operation if specified
+    if let Some(op_str) = &cmd.target_op {
+        intent.target_op = match op_str.to_lowercase().as_str() {
+            "sin" => Some(ArithmeticOp::Sin),
+            "cos" => Some(ArithmeticOp::Cos),
+            "xor" | "xorgate" => Some(ArithmeticOp::XorGate),
+            "and" | "andgate" => Some(ArithmeticOp::AndGate),
+            "or" | "orgate" => Some(ArithmeticOp::OrGate),
+            "not" | "notgate" => Some(ArithmeticOp::NotGate),
+            "hadamard" => Some(ArithmeticOp::Hadamard),
+            _ => intent.target_op,
+        };
+    }
+
+    println!("Intent detected: {}", intent.description);
+    println!("Target operation: {:?}", intent.target_op);
+    println!("Evolving toward intent...");
+
+    // Evolve GA toward the user's intent
+    let best = engine.evolve_to_intent(&intent, &current_state).unwrap_or_else(|e| {
+        error!("Evolution failed: {}", e);
+        std::process::exit(1);
+    });
+
+    println!("Evolution complete!");
+    println!("  Best fitness: {:.4}", best.fitness);
+    println!("  Best genes: {:?}", best.genes.iter().take(8).collect::<Vec<_>>());
+
+    let strategy = engine.meta_strategy();
+    println!("  Meta strategy mutation rate: {:.4}", strategy.mutation_rate);
+    println!("  Meta strategy crossover blend: {:.4}", strategy.crossover_blend);
+}
+
+fn run_verify(cmd: VerifyCmd) {
+    let features: Vec<f64> = cmd.features.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    let mut verifier = Verifier::new(
+        features.len().max(4),
+        0.0,    // min trajectory success rate
+        0.0,    // min intent alignment
+        -1e9,   // min model score
+    );
+
+    let delta_hash = cmd.delta_hash;
+    let intent_hash = cmd.intent_hash;
+
+    // Record a confirmed intent
+    verifier.record_intent(intent_hash, "user confirmed intent".to_string(), 1.0);
+    verifier.confirm_intent(0);
+
+    // Record trajectory outcome
+    let node_idx = verifier.add_trajectory_node("inject".to_string(), RegisterAddress::from(0u128), delta_hash);
+    verifier.record_outcome(node_idx, TrajectoryOutcome::Success);
+
+    // Train scoring model on positive outcome
+    verifier.train_model(&features, true);
+
+    // Verify
+    let passed = verifier.verify(delta_hash, intent_hash, &features);
+
+    println!("Verifier results:");
+    println!("  Trajectory success rate: {:.2}", verifier.trajectory().success_rate());
+    println!("  Intent graph drift: {:.4}", verifier.intent_graph().intent_drift());
+    println!("  Model score: {:.4}", verifier.scoring_model().score(&features));
+    println!("  Verification: {}", if passed { "PASSED" } else { "FAILED" });
 }
 
 fn run_init() {
