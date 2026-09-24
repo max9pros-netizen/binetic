@@ -521,8 +521,8 @@ impl Backend for NativeBackend {
 
         // Real latency based on operand size
         let n_bits = operands.first().map(|o| o.len()).unwrap_or(0);
-        let latency_us = ((n_bits / 64) + 1) * 10; // ~10us per word
-        let energy_nj = latency_us as u64 * 10; // 10 nJ per us
+        let latency_us: u64 = ((n_bits / 64) + 1) as u64 * 10; // ~10us per word
+        let energy_nj = latency_us * 10; // 10 nJ per us
 
         ComputeResult {
             success: true,
@@ -536,29 +536,31 @@ impl Backend for NativeBackend {
 
     fn estimate_energy(&self, _op: &ComputeOp, _operand_tiers: &[TierId]) -> u64 {
         // Real estimate: 10 nJ per bit-operation, scaled by operand size
-        let n_bits = _operand_tiers.iter().map(|t| match t {
-            TierId::HOT => 64,
+        let n_bits = _operand_tiers.iter().map(|t| match *t {
+            TierId::HOT => 64u64,
             TierId::WARM => 64,
             TierId::GPU => 64,
             TierId::COLD => 64,
             TierId::REMOTE => 64,
-        }).sum::<usize>();
-        (n_bits * 10) as u64
+            _ => 64,
+        }).sum::<u64>();
+        n_bits * 10
     }
 
     fn estimate_latency_us(&self, _op: &ComputeOp, operand_tiers: &[TierId]) -> u64 {
         // Real estimate: 10us per 64-bit word, with tier-based locality adjustment
-        let n_bits = operand_tiers.iter().map(|t| match t {
-            TierId::HOT => 64,
+        let n_bits = operand_tiers.iter().map(|t| match *t {
+            TierId::HOT => 64u64,
             TierId::WARM => 64,
             TierId::GPU => 64,
             TierId::COLD => 64,
             TierId::REMOTE => 64,
-        }).sum::<usize>();
+            _ => 64,
+        }).sum::<u64>();
         let base_latency = ((n_bits / 64) + 1) * 10;
         // Remote tier adds network latency
         let remote_penalty = operand_tiers.iter().filter(|t| **t == TierId::REMOTE).count() * 100;
-        (base_latency + remote_penalty) as u64
+        base_latency + remote_penalty as u64
     }
 }
 

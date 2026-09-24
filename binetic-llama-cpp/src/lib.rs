@@ -14,14 +14,14 @@ use binetic_core::{
     address::RegisterAddress,
 };
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CString, c_int};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::cell::RefCell;
+use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{info, warn, error};
 
-use crate::llama_ffi;
+mod llama_ffi;
 
 /// Errors from the llama.cpp backend.
 #[derive(Error, Debug)]
@@ -52,7 +52,7 @@ pub struct LlamaCppBackend {
     model: Option<*mut llama_ffi::llama_model>,
     /// Opaque llama.cpp context pointer. Owning — freed on teardown / drop.
     /// Wrapped in RefCell because llama_eval mutates the context.
-    ctx: RefCell<Option<*mut llama_ffi::llama_context>>,
+    ctx: Mutex<Option<*mut llama_ffi::llama_context>>,
     /// Model metadata (loaded from GGUF header via llama.cpp).
     model_metadata: HashMap<String, String>,
     /// Whether the backend is initialized (context created).
@@ -67,6 +67,11 @@ pub struct LlamaCppBackend {
     n_embd: usize,
 }
 
+// Safety: raw pointers to opaque llama.cpp types are thread-safe because
+// all mutation goes through Mutex-protected access.
+unsafe impl Send for LlamaCppBackend {}
+unsafe impl Sync for LlamaCppBackend {}
+
 impl LlamaCppBackend {
     pub fn new() -> Self {
         Self {
@@ -74,7 +79,7 @@ impl LlamaCppBackend {
             name: "llama.cpp".to_string(),
             model_path: None,
             model: None,
-            ctx: RefCell::new(None),
+            ctx: Mutex::new(None),
             model_metadata: HashMap::new(),
             initialized: false,
             supported_quantizations: vec![
@@ -108,14 +113,14 @@ impl LlamaCppBackend {
         if let Some(old) = self.model.take() {
             unsafe { llama_ffi::llama_model_free(old) };
         }
-        self.ctx.borrow_mut().take();
+        self.ctx.lock().unwrap().take();
         self.initialized = false;
         self.model_metadata.clear();
 
         let c_path = CString::new(path.to_str().unwrap())
             .map_err(|_| LlamaCppError::ModelLoadFailed("Invalid path".into()))?;
 
-        let params = llama_ffi::llama_model_default_params();
+        let params = unsafe { llama_ffi::llama_model_default_params() };
 
         info!("Loading model from {:?} via llama.cpp", path);
 
@@ -233,7 +238,7 @@ impl Backend for LlamaCppBackend {
         // Initialize the llama.cpp backend (sets up thread pools, etc.)
         unsafe { llama_ffi::llama_backend_init() };
 
-        let ctx_params = llama_ffi::llama_context_default_params();
+        let ctx_params = unsafe { llama_ffi::llama_context_default_params() };
 
         let ctx = unsafe {
             llama_ffi::llama_init_from_model(model, ctx_params)
@@ -244,7 +249,7 @@ impl Backend for LlamaCppBackend {
             return Err("llama_init_from_model returned null".into());
         }
 
-        *self.ctx.borrow_mut() = Some(ctx);
+        *self.ctx.lock().unwrap() = Some(ctx);
         self.initialized = true;
 
         info!("llama.cpp context initialized (ctx={:?})", ctx as usize);
@@ -254,7 +259,7 @@ impl Backend for LlamaCppBackend {
 
     fn teardown(&mut self) {
         // Free the context
-        let ctx = self.ctx.borrow_mut().take();
+        let ctx = self.ctx.lock().unwrap().take();
         if let Some(c) = ctx {
             unsafe { llama_ffi::llama_free(c) };
         }
@@ -286,7 +291,7 @@ impl Backend for LlamaCppBackend {
         let energy_nj = self.estimate_energy(op, &[]);
 
         // Check initialization — context must exist
-        let ctx_ptr = match self.ctx.borrow().as_ref() {
+        let ctx_ptr = match self.ctx.lock().unwrap().as_ref() {
             Some(ctx) => *ctx,
             None => {
                 return ComputeResult {
@@ -357,7 +362,7 @@ impl Backend for LlamaCppBackend {
             ArithmeticOp::Add => self.n_embd,
             ArithmeticOp::Mul => self.n_embd,
             _ => 100,
-        };
+        } as u64;
         base.max(1)
     }
 
@@ -377,7 +382,7 @@ impl Backend for LlamaCppBackend {
             ArithmeticOp::Add => self.n_layers,
             ArithmeticOp::Mul => self.n_layers,
             _ => 100,
-        };
+        } as u64;
         base.max(1)
     }
 }
@@ -391,7 +396,7 @@ impl Default for LlamaCppBackend {
 impl Drop for LlamaCppBackend {
     fn drop(&mut self) {
         // Clean up if not already torn down
-        if let Some(ctx) = self.ctx.borrow_mut().take() {
+        if let Some(ctx) = self.ctx.lock().unwrap().take() {
             unsafe { llama_ffi::llama_free(ctx) };
         }
         if let Some(model) = self.model.take() {
@@ -666,7 +671,7 @@ impl LlamaCppBackend {
         // Get attention output via logits
         let logits_ptr = unsafe { llama_ffi::llama_get_logits(ctx_ptr) };
         let payload = if !logits_ptr.is_null() && self.vocab_size > 0 {
-            BitslicedLane::from_bits(&[*logits_ptr.add(0) > 0.0])
+            BitslicedLane::from_bits(&[unsafe { *logits_ptr.add(0) } > 0.0])
         } else {
             BitslicedLane::default()
         };
@@ -741,10 +746,6 @@ mod tests {
     #[test]
     fn test_llama_cpp_metadata() {
         let backend = LlamaCppBackend::new();
-        let meta = backend.metadata();
-        assert!(meta.is_empty());
-    }
-}
         let meta = backend.metadata();
         assert!(meta.is_empty());
     }

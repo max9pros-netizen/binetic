@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use std::ffi::c_char;
-use std::os::raw::{c_bool, c_double, c_float, c_int, c_int64_t, c_size_t, c_uint, c_void};
+use std::os::raw::{c_double, c_float, c_int, c_uint, c_void};
 
 // ── ggml_tensor ──────────────────────────────────────────────────────────────
 
@@ -69,7 +69,7 @@ pub enum ggml_tensor_type {
 #[repr(C)]
 pub struct ggml_tensor {
     pub type_: ggml_tensor_type,
-    pub nelements: c_size_t,
+    pub nelements: usize,
     pub bytes_per_element: usize,
     pub offset: usize,
     pub wdim: u32,
@@ -117,12 +117,12 @@ pub struct llama_model_params {
     pub progress_callback: *mut c_void,
     pub progress_callback_user_data: *mut c_void,
     pub kv_overrides: *mut c_void,
-    pub vocab_only: c_bool,
-    pub check_tensors: c_bool,
-    pub use_extra_bufts: c_bool,
-    pub no_host: c_bool,
-    pub no_alloc: c_bool,
-    pub load_mtp: c_bool,
+    pub vocab_only: bool,
+    pub check_tensors: bool,
+    pub use_extra_bufts: bool,
+    pub no_host: bool,
+    pub no_alloc: bool,
+    pub load_mtp: bool,
 }
 
 // ── llama_context_params ─────────────────────────────────────────────────────
@@ -158,12 +158,12 @@ pub struct llama_context_params {
     pub type_v: c_int,
     pub abort_callback: *mut c_void,
     pub abort_callback_data: *mut c_void,
-    pub embeddings: c_bool,
-    pub offload_kqv: c_bool,
-    pub no_perf: c_bool,
-    pub op_offload: c_bool,
-    pub swa_full: c_bool,
-    pub kv_unified: c_bool,
+    pub embeddings: bool,
+    pub offload_kqv: bool,
+    pub no_perf: bool,
+    pub op_offload: bool,
+    pub swa_full: bool,
+    pub kv_unified: bool,
 }
 
 // ── llama_batch ──────────────────────────────────────────────────────────────
@@ -175,7 +175,7 @@ pub struct llama_batch {
     pub embd: *const c_float,
     pub pos: *const c_int,
     pub seq_id: *const c_int,
-    pub logits: *mut c_int8_t,
+    pub logits: *mut i8,
 }
 
 // ── llama_token_data ─────────────────────────────────────────────────────────
@@ -249,6 +249,7 @@ extern "C" {
     pub fn llama_n_batch(ctx: *const llama_context) -> c_uint;
     pub fn llama_n_ubatch(ctx: *const llama_context) -> c_uint;
     pub fn llama_n_seq_max(ctx: *const llama_context) -> c_uint;
+    pub fn llama_get_logits(ctx: *const llama_context) -> *const c_float;
     pub fn llama_get_tensor(
         ctx: *const llama_context,
         name: *const c_char,
@@ -261,10 +262,10 @@ extern "C" {
         params: *const llama_batch,
     ) -> c_int;
     pub fn llama_reset(ctx: *mut llama_context);
-    pub fn llama_time_us() -> c_int64_t;
-    pub fn llama_supports_mmap() -> c_bool;
-    pub fn llama_supports_mlock() -> c_bool;
-    pub fn llama_supports_gpu_offload() -> c_bool;
+    pub fn llama_time_us() -> i64;
+    pub fn llama_supports_mmap() -> bool;
+    pub fn llama_supports_mlock() -> bool;
+    pub fn llama_supports_gpu_offload() -> bool;
     pub fn llama_backend_init();
     pub fn llama_backend_free();
 }
@@ -282,8 +283,8 @@ extern "C" {
         text: *const c_char,
         tokens: *mut c_int,
         n_max_tokens: c_int,
-        apply_special: c_bool,
-        parse_special: c_bool,
+        apply_special: bool,
+        parse_special: bool,
     ) -> c_int;
 }
 
@@ -295,6 +296,7 @@ extern "C" {
         params: llama_sampler_chain_params,
     ) -> *mut llama_sampler;
     pub fn llama_sampler_free(sampler: *mut llama_sampler);
+    pub fn llama_sampler_init_greedy() -> *mut llama_sampler;
     pub fn llama_sampler_sample(
         sampler: *mut llama_sampler,
         ctx: *const llama_context,
