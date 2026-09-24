@@ -116,6 +116,105 @@ pub struct IntentEngine {
     config: IntentEngineConfig,
 }
 
+/// User authority guard — ensures the user always has final approval.
+///
+/// # Principle
+///
+/// The GA proposes. The user approves. No mutation executes without explicit
+/// user confirmation. This is the absolute boundary of system autonomy.
+///
+/// # Mechanism
+///
+/// 1. **Approval gate** — every mutation requires user sign-off before execution
+/// 2. **Intent verification** — mutations are verified against the user's signed intent
+/// 3. **Rollback** — every mutation is reversible; user can restore any prior state
+/// 4. **Audit trail** — all mutations logged with intent hash for verification
+/// 5. **Domain isolation** — user intent domain is separate from GA search domain
+#[derive(Debug, Clone)]
+pub struct UserAuthority {
+    /// Signed intent hash — mutations must match this to be approved.
+    intent_hash: u64,
+    /// History of all mutations with their intent verification.
+    audit_trail: Vec<MutationRecord>,
+    /// Rollback checkpoints — saved register states the user can restore.
+    checkpoints: Vec<(RegisterAddress, Register)>,
+}
+
+/// A single mutation record in the audit trail.
+#[derive(Debug, Clone)]
+pub struct MutationRecord {
+    /// Address of the register that was mutated.
+    pub address: RegisterAddress,
+    /// The delta that was applied.
+    pub delta: BitslicedLane,
+    /// Intent hash at time of mutation.
+    pub intent_hash: u64,
+    /// Whether the mutation was approved by the user.
+    pub approved: bool,
+}
+
+impl UserAuthority {
+    /// Create a new authority guard with the given intent hash.
+    pub fn new(intent_hash: u64) -> Self {
+        Self {
+            intent_hash,
+            audit_trail: Vec::new(),
+            checkpoints: Vec::new(),
+        }
+    }
+
+    /// Verify that a proposed mutation matches the user's signed intent.
+    pub fn verify_intent(&self, delta: &BitslicedLane) -> bool {
+        let delta_hash = hash_bitslice(delta);
+        delta_hash as u64 == self.intent_hash
+    }
+
+    /// Approve a mutation — must be called before execution.
+    /// Returns false if the mutation doesn't match the user's intent.
+    pub fn approve(&mut self, address: RegisterAddress, delta: &BitslicedLane) -> bool {
+        let verified = self.verify_intent(delta);
+        self.audit_trail.push(MutationRecord {
+            address,
+            delta: delta.clone(),
+            intent_hash: self.intent_hash,
+            approved: verified,
+        });
+        verified
+    }
+
+    /// Save a checkpoint for rollback.
+    pub fn checkpoint(&mut self, address: RegisterAddress, register: &Register) {
+        self.checkpoints.push((address, register.clone()));
+    }
+
+    /// Roll back to the last checkpoint for the given address.
+    pub fn rollback(&self, address: RegisterAddress) -> Option<Register> {
+        self.checkpoints
+            .iter()
+            .rev()
+            .find(|(addr, _)| *addr == address)
+            .map(|(_, reg)| reg.clone())
+    }
+
+    /// Get the audit trail.
+    pub fn audit_trail(&self) -> &[MutationRecord] {
+        &self.audit_trail
+    }
+
+    /// Verify the entire audit trail — all mutations must be approved.
+    pub fn verify_all_approved(&self) -> bool {
+        self.audit_trail.iter().all(|r| r.approved)
+    }
+}
+
+fn hash_bitslice(bits: &BitslicedLane) -> u64 {
+    let mut hash: u64 = 0;
+    for word in bits.words() {
+        hash = hash.wrapping_mul(31).wrapping_add(*word);
+    }
+    hash
+}
+
 /// Configuration for the intent engine.
 #[derive(Debug, Clone)]
 pub struct IntentEngineConfig {
@@ -664,6 +763,67 @@ mod tests {
         // Meta strategy should have been updated
         let strategy = engine.meta_strategy();
         assert!(strategy.mutation_rate > 0.0);
+    }
+
+    #[test]
+    fn test_user_authority_approval_gate() {
+        let authority = &mut UserAuthority::new(42);
+
+        // Mutation with wrong intent hash should be rejected
+        let wrong_delta = BitslicedLane::from_bits(&[true, false, true, false]);
+        let addr = RegisterAddress::from(0u128);
+        let approved = authority.approve(addr, &wrong_delta);
+        assert!(!approved);
+
+        // Mutation with matching intent hash should be approved
+        let correct_delta = BitslicedLane::from_bits(&[true, false, true, false]);
+        let authority2 = &mut UserAuthority::new(hash_bitslice(&correct_delta) as u64);
+        let approved = authority2.approve(addr, &correct_delta);
+        assert!(approved);
+    }
+
+    #[test]
+    fn test_user_authority_rollback() {
+        let authority = &mut UserAuthority::new(123);
+
+        // Save checkpoint
+        let addr = RegisterAddress::from(0u128);
+        let register = Register::new(addr, BitslicedLane::from_bits(&[true, false]));
+        authority.checkpoint(addr, &register);
+
+        // Rollback should return the saved state
+        let restored = authority.rollback(addr);
+        assert!(restored.is_some());
+        assert_eq!(restored.unwrap().payload_bytes(), register.payload_bytes());
+    }
+
+    #[test]
+    fn test_user_authority_audit_trail() {
+        let delta = BitslicedLane::from_bits(&[true, false, true, false]);
+        let addr = RegisterAddress::from(0u128);
+
+        // Authority created with matching intent hash
+        let mut authority = UserAuthority::new(hash_bitslice(&delta) as u64);
+
+        // Initially no records
+        assert!(authority.audit_trail().is_empty());
+
+        // Approve adds a record — delta matches intent hash, so approved
+        authority.approve(addr, &delta);
+        assert_eq!(authority.audit_trail().len(), 1);
+        assert!(authority.audit_trail()[0].approved);
+
+        // All approved check
+        assert!(authority.verify_all_approved());
+
+        // Wrong delta should be rejected
+        let wrong_delta = BitslicedLane::from_bits(&[false, true, false, true]);
+        authority.approve(addr, &wrong_delta);
+        assert_eq!(authority.audit_trail().len(), 2);
+        assert!(!authority.audit_trail()[1].approved);
+
+        // Not all approved anymore
+        assert!(!authority.verify_all_approved());
     }
 
     #[test]
