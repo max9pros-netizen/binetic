@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "binetic-core",
+    "binetic-intent",
     "binetic-llama-cpp",
     "binetic-mlx",
     "binetic-cli",

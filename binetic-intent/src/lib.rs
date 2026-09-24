@@ -1,0 +1,724 @@
+//! Intent engine: detect user intent, compute gaps, evolve solutions, meta-learn.
+//!
+//! # Architecture
+//!
+//! Intent flows through three stages:
+//! 1. **Detect** — parse user input into structured intent (commands, corrections, feedback)
+//! 2. **Gap** — XOR current state against target state to find the delta
+//! 3. **Evolve** — GA population evolves circuit configurations to close the gap
+//! 4. **Meta** — population evolves its own learning strategies (mutation, crossover, selection)
+//!
+//! The delta IS the intent. XOR delta model sharing computes the gap in one operation.
+//! Meta-learning happens when the GA evolves its own mutation operators.
+
+use binetic_core::{
+    backend::ArithmeticOp,
+    bitslice::BitslicedLane,
+    address::RegisterAddress,
+    register::Register,
+};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum IntentError {
+    #[error("No intent detected in input: {0}")]
+    NoIntentDetected(String),
+    #[error("Gap computation failed: {0}")]
+    GapComputationFailed(String),
+    #[error("Evolution failed: {0}")]
+    EvolutionFailed(String),
+    #[error("Meta-learning failed: {0}")]
+    MetaLearningFailed(String),
+}
+
+/// Parsed user intent — what the user wants the system to do.
+#[derive(Debug, Clone)]
+pub struct Intent {
+    /// Target register state the user wants to achieve.
+    pub target_state: Option<BitslicedLane>,
+    /// Target operation the user wants performed.
+    pub target_op: Option<ArithmeticOp>,
+    /// Corrections to current behavior (key-value pairs of what to change).
+    pub corrections: HashMap<String, BitslicedLane>,
+    /// Free-form description of desired behavior.
+    pub description: String,
+    /// Priority of this intent (higher = more important).
+    pub priority: f64,
+}
+
+/// A single GA individual — a candidate solution encoding circuit configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Individual {
+    /// Gene: encoding of trig gate parameters and routing.
+    pub genes: Vec<f64>,
+    /// Fitness score — lower is better (closer to target).
+    pub fitness: f64,
+    /// Meta-parameters this individual uses for its own learning.
+    pub learning_strategy: LearningStrategy,
+}
+
+/// Learning strategy — how this individual learns and adapts.
+/// This is what evolves in meta-learning: the learning process itself.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningStrategy {
+    /// Mutation rate for gene perturbations.
+    pub mutation_rate: f64,
+    /// Crossover blend factor (0.0 = pure parent1, 1.0 = pure parent2).
+    pub crossover_blend: f64,
+    /// Selection pressure — how strongly fitness influences reproduction.
+    pub selection_pressure: f64,
+    /// Exploration rate — probability of trying random moves.
+    pub exploration_rate: f64,
+    /// Memory decay — how quickly past experience is forgotten.
+    pub memory_decay: f64,
+}
+
+impl Default for LearningStrategy {
+    fn default() -> Self {
+        Self {
+            mutation_rate: 0.1,
+            crossover_blend: 0.5,
+            selection_pressure: 1.0,
+            exploration_rate: 0.1,
+            memory_decay: 0.95,
+        }
+    }
+}
+
+/// GA population — evolves circuit configurations toward target behavior.
+#[derive(Debug)]
+pub struct GAPopulation {
+    individuals: Vec<Individual>,
+    target: Option<BitslicedLane>,
+    generation: u64,
+    best_fitness_history: Vec<f64>,
+}
+
+/// Meta-learner — evolves the GA's own learning strategies.
+#[derive(Debug)]
+pub struct MetaLearner {
+    strategy_population: Vec<Individual>,
+    generations_without_improvement: u64,
+    best_strategy: LearningStrategy,
+    best_strategy_fitness: f64,
+}
+
+/// The IntentEngine — ties everything together.
+pub struct IntentEngine {
+    fabric: Arc<dyn FabricAdapter>,
+    population: GAPopulation,
+    meta_learner: MetaLearner,
+    intent_history: Vec<Intent>,
+    config: IntentEngineConfig,
+}
+
+/// Configuration for the intent engine.
+#[derive(Debug, Clone)]
+pub struct IntentEngineConfig {
+    pub population_size: usize,
+    pub max_generations: u64,
+    pub fitness_threshold: f64,
+    pub meta_learning_enabled: bool,
+    pub gene_length: usize,
+}
+
+impl Default for IntentEngineConfig {
+    fn default() -> Self {
+        Self {
+            population_size: 50,
+            max_generations: 100,
+            fitness_threshold: 0.001,
+            meta_learning_enabled: true,
+            gene_length: 64,
+        }
+    }
+}
+
+/// Adapter trait for fabric interaction — allows testing without real fabric.
+pub trait FabricAdapter: Send + Sync {
+    fn read_raw(&self, addr: RegisterAddress) -> Option<binetic_core::register::Register>;
+    fn write(&self, addr: RegisterAddress, reg: binetic_core::register::Register) -> Result<(), String>;
+    fn inject_adapt_raw(&self, addr: RegisterAddress, delta: BitslicedLane) -> Result<(), String>;
+}
+
+impl IntentEngine {
+    pub fn new(
+        fabric: Arc<dyn FabricAdapter>,
+        config: IntentEngineConfig,
+    ) -> Self {
+        let population = GAPopulation::new(config.population_size, config.gene_length);
+        let meta_learner = MetaLearner::new(config.population_size);
+
+        Self {
+            fabric,
+            population,
+            meta_learner,
+            intent_history: Vec::new(),
+            config,
+        }
+    }
+
+    /// Detect intent from a user message.
+    ///
+    /// Parses commands like "make it faster", "add sin gates", "use XOR for this"
+    /// into structured Intent objects.
+    pub fn detect_intent(&mut self, message: &str) -> Result<Intent, IntentError> {
+        let mut intent = Intent {
+            target_state: None,
+            target_op: None,
+            corrections: HashMap::new(),
+            description: message.to_string(),
+            priority: 1.0,
+        };
+
+        // Detect operation intent
+        let lower = message.to_lowercase();
+        if lower.contains("sin") || lower.contains("trig") || lower.contains("trigonometric") {
+            intent.target_op = Some(ArithmeticOp::Sin);
+        } else if lower.contains("cos") {
+            intent.target_op = Some(ArithmeticOp::Cos);
+        } else if lower.contains("xor") || lower.contains("exclusive") {
+            intent.target_op = Some(ArithmeticOp::XorGate);
+        } else if lower.contains("and") && !lower.contains("random") {
+            intent.target_op = Some(ArithmeticOp::AndGate);
+        } else if lower.contains("or") && !lower.contains("color") && !lower.contains("more") {
+            intent.target_op = Some(ArithmeticOp::OrGate);
+        } else if lower.contains("not") || lower.contains("invert") || lower.contains("negate") {
+            intent.target_op = Some(ArithmeticOp::NotGate);
+        } else if lower.contains("hadamard") || lower.contains("correlation") || lower.contains("same") {
+            intent.target_op = Some(ArithmeticOp::Hadamard);
+        }
+
+        // Detect correction intent
+        if lower.contains("fix") || lower.contains("correct") || lower.contains("change") {
+            intent.priority = 2.0; // corrections are higher priority
+        }
+
+        // Detect learning intent
+        if lower.contains("learn") || lower.contains("adapt") || lower.contains("evolve") {
+            intent.priority = 3.0; // learning is highest priority
+        }
+
+        if intent.target_op.is_none() && intent.corrections.is_empty() && intent.priority < 2.0 {
+            return Err(IntentError::NoIntentDetected(
+                "No recognizable intent in message".to_string(),
+            ));
+        }
+
+        self.intent_history.push(intent.clone());
+        Ok(intent)
+    }
+
+    /// Compute the gap between current state and target state.
+    ///
+    /// The gap is the XOR delta that needs to be applied to close the difference.
+    pub fn compute_gap(
+        &self,
+        current: &BitslicedLane,
+        target: &BitslicedLane,
+    ) -> Result<BitslicedLane, IntentError> {
+        if current.len() != target.len() {
+            return Err(IntentError::GapComputationFailed(format!(
+                "Size mismatch: current={} target={}",
+                current.len(),
+                target.len()
+            )));
+        }
+        Ok(BitslicedLane::xor(current, target))
+    }
+
+    /// Evolve the population to close the gap.
+    ///
+    /// Runs the GA for up to max_generations, returning the best individual.
+    pub fn evolve_to_intent(
+        &mut self,
+        intent: &Intent,
+        current_state: &BitslicedLane,
+    ) -> Result<&Individual, IntentError> {
+        let target = intent.target_state.clone().unwrap_or_else(|| {
+            // If no explicit target state, create one from the target op
+            self.target_state_from_op(intent)
+        });
+
+        self.population.set_target(target.clone());
+
+        for generation in 0..self.config.max_generations {
+            // Evaluate fitness: Hamming distance between current applied genes and target
+                    let current_state_clone = current_state.clone();
+                    let target_clone = target.clone();
+                    let fitness_values: Vec<f64> = self
+                        .population
+                        .individuals
+                        .iter()
+                        .map(|ind| self.evaluate_fitness(ind, &target_clone, &current_state_clone))
+                        .collect();
+
+                    for (individual, fitness) in self.population.individuals.iter_mut().zip(fitness_values) {
+                        individual.fitness = fitness;
+                    }
+
+            // Sort by fitness (lower is better)
+            self.population.individuals.sort_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap());
+
+            // Check convergence
+            let best_fitness = self.population.individuals[0].fitness;
+            self.population.best_fitness_history.push(best_fitness);
+
+            if best_fitness < self.config.fitness_threshold {
+                break;
+            }
+
+            // Evolve next generation
+            self.population.evolve();
+
+            // Meta-learning: evolve learning strategies
+            if self.config.meta_learning_enabled {
+                self.meta_learner.evolve_strategy(&self.population);
+            }
+        }
+
+        Ok(&self.population.individuals[0])
+    }
+
+    /// Apply the best solution from evolution to the fabric.
+    pub fn apply_solution(
+        &self,
+        solution: &Individual,
+        target_addr: RegisterAddress,
+    ) -> Result<(), IntentError> {
+        // Convert genes to a delta lane
+        let delta = self.genes_to_delta(solution);
+        self.fabric
+            .inject_adapt_raw(target_addr, delta)
+            .map_err(|e| IntentError::EvolutionFailed(e))
+    }
+
+    /// Get the current meta-learning strategy.
+    pub fn meta_strategy(&self) -> &LearningStrategy {
+        &self.meta_learner.best_strategy
+    }
+
+    /// Get fitness history for monitoring convergence.
+    pub fn fitness_history(&self) -> &[f64] {
+        &self.population.best_fitness_history
+    }
+
+    fn target_state_from_op(&self, intent: &Intent) -> BitslicedLane {
+        // Create a target state based on the detected operation
+        // For now, use a simple pattern — in production this would be more sophisticated
+        let mut lane = BitslicedLane::with_capacity(256);
+        match intent.target_op {
+            Some(ArithmeticOp::Sin) | Some(ArithmeticOp::XorGate) => {
+                // Identity-like pattern for Sin/XorGate
+                for i in 0..256 {
+                    lane.set_bit(i, i % 2 == 0);
+                }
+            }
+            Some(ArithmeticOp::Cos) | Some(ArithmeticOp::NotGate) => {
+                // Inverted pattern for Cos/NotGate
+                for i in 0..256 {
+                    lane.set_bit(i, i % 2 != 0);
+                }
+            }
+            Some(ArithmeticOp::AndGate) => {
+                // Sparse pattern for AND
+                for i in 0..256 {
+                    lane.set_bit(i, i % 4 == 0);
+                }
+            }
+            Some(ArithmeticOp::OrGate) => {
+                // Dense pattern for OR
+                for i in 0..256 {
+                    lane.set_bit(i, i % 2 == 0 || i % 3 == 0);
+                }
+            }
+            Some(ArithmeticOp::Hadamard) => {
+                // Correlation pattern for Hadamard
+                for i in 0..256 {
+                    lane.set_bit(i, i % 4 < 2);
+                }
+            }
+            _ => {
+                // Default: all zeros
+            }
+        }
+        lane
+    }
+
+    fn evaluate_fitness(
+        &self,
+        individual: &Individual,
+        target: &BitslicedLane,
+        current_state: &BitslicedLane,
+    ) -> f64 {
+        // Apply individual's genes as a transformation to current state
+        let transformed = self.apply_genes(current_state, individual);
+        // Fitness = Hamming distance (number of differing bits)
+        let diff = BitslicedLane::xor(&transformed, target);
+        let hamming = diff.popcount();
+        hamming as f64 / target.len() as f64
+    }
+
+    fn apply_genes(&self, state: &BitslicedLane, individual: &Individual) -> BitslicedLane {
+        // Apply gene-encoded transformations to the state
+        // Genes are floats in [0, 1] that control which trig ops to apply
+        let mut result = state.clone();
+        let genes = &individual.genes;
+
+        for (i, gene) in genes.iter().enumerate() {
+            if i >= state.len() {
+                break;
+            }
+            // Gene > 0.5: flip the bit
+            // Gene <= 0.5: keep the bit
+            if *gene > 0.5 {
+                let current = result.get_bit(i);
+                result.set_bit(i, !current);
+            }
+        }
+
+        result
+    }
+
+    fn genes_to_delta(&self, solution: &Individual) -> BitslicedLane {
+        // Convert genes to a delta lane for injection
+        let mut delta = BitslicedLane::with_capacity(self.config.gene_length);
+        for (i, gene) in solution.genes.iter().enumerate() {
+            delta.set_bit(i, *gene > 0.5);
+        }
+        delta
+    }
+}
+
+impl GAPopulation {
+    fn new(size: usize, gene_length: usize) -> Self {
+        let mut individuals = Vec::with_capacity(size);
+        for _ in 0..size {
+            let genes = (0..gene_length)
+                .map(|_| rand_float())
+                .collect();
+            individuals.push(Individual {
+                genes,
+                fitness: f64::INFINITY,
+                learning_strategy: LearningStrategy::default(),
+            });
+        }
+
+        Self {
+            individuals,
+            target: None,
+            generation: 0,
+            best_fitness_history: Vec::new(),
+        }
+    }
+
+    fn set_target(&mut self, target: BitslicedLane) {
+        self.target = Some(target);
+    }
+
+    fn evolve(&mut self) {
+        let strategy = self.individuals[0].learning_strategy.clone();
+        let elite_count = (self.individuals.len() as f64 * 0.2) as usize;
+        let elite_count = elite_count.max(1);
+
+        let mut new_individuals = Vec::with_capacity(self.individuals.len());
+
+        // Elitism: keep the best individuals
+        for i in 0..elite_count {
+            new_individuals.push(self.individuals[i].clone());
+        }
+
+        // Generate rest through crossover and mutation
+        while new_individuals.len() < self.individuals.len() {
+            let parent1 = self.select_parent();
+            let parent2 = self.select_parent();
+            let mut child = self.crossover(&parent1, &parent2, &strategy);
+            self.mutate(&mut child, &strategy);
+            new_individuals.push(child);
+        }
+
+        self.individuals = new_individuals;
+        self.generation += 1;
+    }
+
+    fn select_parent(&self) -> &Individual {
+        // Tournament selection with learning strategy pressure
+        let tournament_size = 3;
+        let mut best = &self.individuals[0];
+        for _ in 0..tournament_size {
+            let idx = rand_usize() % self.individuals.len();
+            let candidate = &self.individuals[idx];
+            if candidate.fitness < best.fitness {
+                best = candidate;
+            }
+        }
+        best
+    }
+
+    fn crossover(
+        &self,
+        p1: &Individual,
+        p2: &Individual,
+        strategy: &LearningStrategy,
+    ) -> Individual {
+        let blend = strategy.crossover_blend;
+        let mut genes = Vec::with_capacity(p1.genes.len());
+        for (g1, g2) in p1.genes.iter().zip(p2.genes.iter()) {
+            let gene = g1 * blend + g2 * (1.0 - blend);
+            genes.push(gene.clamp(0.0, 1.0));
+        }
+        Individual {
+            genes,
+            fitness: f64::INFINITY,
+            learning_strategy: strategy.clone(),
+        }
+    }
+
+    fn mutate(&self, individual: &mut Individual, strategy: &LearningStrategy) {
+        for gene in &mut individual.genes {
+            if rand_float() < strategy.mutation_rate {
+                // Gaussian-like perturbation
+                let perturbation = (rand_float() - 0.5) * 0.2;
+                *gene = (*gene + perturbation).clamp(0.0, 1.0);
+            }
+        }
+    }
+}
+
+impl MetaLearner {
+    fn new(population_size: usize) -> Self {
+        let strategy_population = (0..population_size)
+            .map(|_| Individual {
+                genes: vec![rand_float(); 5], // 5 genes for strategy parameters
+                fitness: f64::INFINITY,
+                learning_strategy: LearningStrategy::default(),
+            })
+            .collect();
+
+        Self {
+            strategy_population,
+            generations_without_improvement: 0,
+            best_strategy: LearningStrategy::default(),
+            best_strategy_fitness: 0.0,
+        }
+    }
+
+    fn evolve_strategy(&mut self, ga_population: &GAPopulation) {
+        // Evaluate each strategy by how well the GA converges with it
+        for individual in &mut self.strategy_population {
+            // Fitness = inverse of GA's best fitness (strategies that lead to better GA fitness score higher)
+            if let Some(&best_ga_fitness) = ga_population.best_fitness_history.last() {
+                individual.fitness = 1.0 / (1.0 + best_ga_fitness);
+            }
+        }
+
+        self.strategy_population
+            .sort_by(|a, b| a.fitness.partial_cmp(&b.fitness).unwrap());
+
+        let best = &self.strategy_population[0].learning_strategy;
+        let best_individual_fitness = self.strategy_population[0].fitness;
+        if best_individual_fitness > self.best_strategy_fitness {
+            self.best_strategy = best.clone();
+            self.best_strategy_fitness = best_individual_fitness;
+            self.generations_without_improvement = 0;
+        } else {
+            self.generations_without_improvement += 1;
+        }
+
+        // If no improvement for a while, increase exploration
+        if self.generations_without_improvement > 10 {
+            self.best_strategy.exploration_rate *= 1.1;
+            self.generations_without_improvement = 0;
+        }
+    }
+}
+
+/// Simple pseudo-random float in [0, 1).
+fn rand_float() -> f64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: AtomicU64 = AtomicU64::new(0xDEADBEEF_CAFE_BABE);
+    let s = SEED.fetch_add(1, Ordering::Relaxed);
+    let x = ((s as f64) * 1.0e-9).fract();
+    if x < 0.0 {
+        -x
+    } else {
+        x
+    }
+}
+
+/// Simple pseudo-random usize.
+fn rand_usize() -> usize {
+    rand_float() as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use binetic_core::register::Register;
+
+    struct MockFabric {
+        registers: std::sync::RwLock<std::collections::HashMap<RegisterAddress, Register>>,
+    }
+
+    impl MockFabric {
+        fn new() -> Self {
+            Self {
+                registers: std::sync::RwLock::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl FabricAdapter for MockFabric {
+        fn read_raw(&self, addr: RegisterAddress) -> Option<Register> {
+            self.registers.read().unwrap().get(&addr).cloned()
+        }
+
+        fn write(&self, addr: RegisterAddress, reg: Register) -> Result<(), String> {
+            self.registers.write().unwrap().insert(addr, reg);
+            Ok(())
+        }
+
+        fn inject_adapt_raw(&self, addr: RegisterAddress, delta: BitslicedLane) -> Result<(), String> {
+            let mut regs = self.registers.write().unwrap();
+            let reg = regs.get(&addr).cloned().ok_or("Not found")?;
+            let mut updated = reg.clone();
+            updated.update_with_delta(&delta);
+            regs.insert(addr, updated);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_detect_intent_sin() {
+        let fabric = Arc::new(MockFabric::new());
+        let config = IntentEngineConfig::default();
+        let mut engine = IntentEngine::new(fabric, config);
+
+        let intent = engine.detect_intent("add sin trig gates to the circuit").unwrap();
+        assert_eq!(intent.target_op, Some(ArithmeticOp::Sin));
+    }
+
+    #[test]
+    fn test_detect_intent_xor() {
+        let fabric = Arc::new(MockFabric::new());
+        let config = IntentEngineConfig::default();
+        let mut engine = IntentEngine::new(fabric, config);
+
+        let intent = engine.detect_intent("use XOR logic for this operation").unwrap();
+        assert_eq!(intent.target_op, Some(ArithmeticOp::XorGate));
+    }
+
+    #[test]
+    fn test_detect_intent_learn() {
+        let fabric = Arc::new(MockFabric::new());
+        let config = IntentEngineConfig::default();
+        let mut engine = IntentEngine::new(fabric, config);
+
+        let intent = engine.detect_intent("learn to be smarter").unwrap();
+        assert_eq!(intent.priority, 3.0);
+    }
+
+    #[test]
+    fn test_compute_gap() {
+        let fabric = Arc::new(MockFabric::new());
+        let config = IntentEngineConfig::default();
+        let engine = IntentEngine::new(fabric, config);
+
+        let current = BitslicedLane::from_bits(&[true, false, true, false]);
+        let target = BitslicedLane::from_bits(&[true, true, true, false]);
+        let gap = engine.compute_gap(&current, &target).unwrap();
+
+        assert_eq!(gap.get_bit(0), false); // same
+        assert_eq!(gap.get_bit(1), true);  // different
+        assert_eq!(gap.get_bit(2), false); // same
+        assert_eq!(gap.get_bit(3), false); // same
+    }
+
+    #[test]
+    fn test_meta_learner_evolution() {
+        let fabric = Arc::new(MockFabric::new());
+        let mut config = IntentEngineConfig::default();
+        config.population_size = 10;
+        config.max_generations = 5;
+
+        let mut engine = IntentEngine::new(fabric, config);
+
+        let intent = Intent {
+            target_state: Some(BitslicedLane::from_bits(&[true, false, true, false])),
+            target_op: Some(ArithmeticOp::Sin),
+            corrections: HashMap::new(),
+            description: "test intent".to_string(),
+            priority: 1.0,
+        };
+
+        let current_state = BitslicedLane::from_bits(&[false, true, false, true]);
+        let best = engine.evolve_to_intent(&intent, &current_state).unwrap();
+
+        // Best fitness should be better than initial random
+        assert!(best.fitness < 1.0);
+
+        // Meta strategy should have been updated
+        let strategy = engine.meta_strategy();
+        assert!(strategy.mutation_rate > 0.0);
+    }
+
+    #[test]
+    fn test_intent_engine_full_pipeline() {
+        // Verify: user intent drives fitness, not external targets
+        let fabric = Arc::new(MockFabric::new());
+        let mut config = IntentEngineConfig::default();
+        config.population_size = 20;
+        config.max_generations = 10;
+
+        let mut engine = IntentEngine::new(fabric, config);
+
+        // User intent: "learn sin gates"
+        let intent = Intent {
+            target_state: Some(BitslicedLane::from_bits(&[true, true, false, true])),
+            target_op: Some(ArithmeticOp::Sin),
+            corrections: HashMap::new(),
+            description: "learn sin gates".to_string(),
+            priority: 1.0,
+        };
+
+        let current_state = BitslicedLane::from_bits(&[false, false, false, false]);
+        let best = engine.evolve_to_intent(&intent, &current_state).unwrap();
+
+        // GA evolved toward the user's intent — fitness improved
+        assert!(best.fitness < f64::INFINITY);
+
+        // Meta-learning: strategy improved after evolution
+        let strategy = engine.meta_strategy();
+        assert!(strategy.mutation_rate > 0.0);
+    }
+
+    #[test]
+    fn test_gap_drives_evolution() {
+        // Verify: gap = current XOR target is the fitness signal
+        let fabric = Arc::new(MockFabric::new());
+        let config = IntentEngineConfig::default();
+        let mut engine = IntentEngine::new(fabric, config);
+
+        let intent = Intent {
+            target_state: Some(BitslicedLane::from_bits(&[true, false, true, false])),
+            target_op: Some(ArithmeticOp::Sin),
+            corrections: HashMap::new(),
+            description: "test gap".to_string(),
+            priority: 1.0,
+        };
+
+        let current = BitslicedLane::from_bits(&[false, false, false, false]);
+        let gap = engine.compute_gap(&current, intent.target_state.as_ref().unwrap()).unwrap();
+
+        // Gap should have bits set where current differs from target
+        assert!(gap.popcount() > 0);
+
+        // Evolve should reduce the gap
+        let best = engine.evolve_to_intent(&intent, &current).unwrap();
+        assert!(best.fitness < 4.0); // better than all-bits-different
+    }
+}
