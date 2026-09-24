@@ -9,7 +9,7 @@
 //! - Adaptation (inject deltas, monitor adaptation stats)
 
 use binetic_core::{
-    backend::{ArithmeticOp, BackendId, ComputeOp, ComputeParams, QuantizationLevel, RoutingPolicy},
+    backend::{ArithmeticOp, Backend, BackendId, ComputeOp, ComputeParams, QuantizationLevel, RoutingPolicy},
     echo::EchoPurpose,
     fabric::{Fabric, FabricConfig, FabricStats},
     rotation::{EnergyState, RotationPolicy, ThermalState},
@@ -63,6 +63,10 @@ struct InferenceCmd {
     /// Model name to use.
     #[arg(short, long)]
     model: String,
+
+    /// Path to the GGUF model file.
+    #[arg(short, long)]
+    model_path: Option<PathBuf>,
 
     /// Prompt to infer.
     #[arg(short, long)]
@@ -219,11 +223,38 @@ fn run_inference(cmd: InferenceCmd) {
 
     fabric.initialize().expect("Failed to initialize fabric");
 
-    // Attach model if not already attached
+    // Wire up llama.cpp backend for real predictive next-token inference
+    let model_path = match cmd.model_path {
+        Some(p) => p,
+        None => {
+            error!("--model-path <GGUF_PATH> is required for real inference");
+            return;
+        }
+    };
+
+    let mut llama_backend = binetic_llama_cpp::LlamaCppBackend::new();
+    if let Err(e) = llama_backend.load_model(&model_path) {
+        error!("Failed to load model '{}': {}", model_path.display(), e);
+        return;
+    }
+    info!("Model loaded from {}", model_path.display());
+
+    if let Err(e) = llama_backend.init() {
+        error!("Failed to initialize llama.cpp backend: {}", e);
+        return;
+    }
+    info!("llama.cpp backend initialized");
+
+    // Add llama.cpp backend to fabric's backend set
+    {
+        let backends_arc = fabric.backends();
+        let mut backends = backends_arc.write();
+        backends.add(Box::new(llama_backend));
+    }
+
+    // Attach model in fabric
     if fabric.get_model(&cmd.model).is_none() {
-        info!("Attaching model: {}", cmd.model);
-        // In a real implementation, this would download / load the model
-        // For now, we just create a placeholder attachment
+        let _ = fabric.attach_model(&cmd.model, "", QuantizationLevel::Q4_0, false, None);
     }
 
     // Set energy state
@@ -233,6 +264,7 @@ fn run_inference(cmd: InferenceCmd) {
     let kv_addr = RegisterAddress::new(0xE000, 0, 0, 0, 0, 0);
     let act_addr = RegisterAddress::new(0xF000, 0, 0, 0, 0, 0);
 
+    // Predictive next-token inference loop
     let mut total_tokens = 0;
     let start = std::time::Instant::now();
 
@@ -246,12 +278,14 @@ fn run_inference(cmd: InferenceCmd) {
             cmd.top_p,
         );
 
-        total_tokens += 1;
-
         if result.success {
-            // In a real implementation, we'd decode the token and print it
-            print!(".");
-            std::io::stdout().flush().unwrap();
+            total_tokens += 1;
+            // Decode and print the sampled token
+            if let Some(ref payload) = result.payload {
+                let token_id = payload.get_bit(0) as u32;
+                print!(" token:{} ", token_id);
+                let _ = std::io::stdout().flush();
+            }
         } else {
             warn!("Compute failed at token {}: {:?}", i, result.error_message);
             break;
