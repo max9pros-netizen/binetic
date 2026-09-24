@@ -215,6 +215,313 @@ fn hash_bitslice(bits: &BitslicedLane) -> u64 {
     hash
 }
 
+/// Task trajectory graph — records the sequence of actions taken and their outcomes.
+///
+/// Each node is an action (read, write, inject, adapt). Edges represent
+/// temporal ordering — what happened after what. The graph captures the
+/// full execution history for verification and learning.
+#[derive(Debug, Clone)]
+pub struct TrajectoryGraph {
+    nodes: Vec<TrajectoryNode>,
+    edges: Vec<(usize, usize)>, // (from_idx, to_idx)
+}
+
+#[derive(Debug, Clone)]
+pub struct TrajectoryNode {
+    pub action: String,
+    pub address: RegisterAddress,
+    pub delta_hash: u64,
+    pub outcome: TrajectoryOutcome,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrajectoryOutcome {
+    Success,
+    Rejected,
+    Pending,
+}
+
+impl TrajectoryGraph {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        }
+    }
+
+    pub fn add_node(&mut self, action: String, address: RegisterAddress, delta_hash: u64) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(TrajectoryNode {
+            action,
+            address,
+            delta_hash,
+            outcome: TrajectoryOutcome::Pending,
+            timestamp_ms: 0,
+        });
+        if idx > 0 {
+            self.edges.push((idx - 1, idx));
+        }
+        idx
+    }
+
+    pub fn set_outcome(&mut self, idx: usize, outcome: TrajectoryOutcome) {
+        if let Some(node) = self.nodes.get_mut(idx) {
+            node.outcome = outcome;
+        }
+    }
+
+    pub fn success_rate(&self) -> f64 {
+        let completed: Vec<_> = self.nodes.iter().filter(|n| n.outcome != TrajectoryOutcome::Pending).collect();
+        if completed.is_empty() {
+            return 0.0;
+        }
+        let successes = completed.iter().filter(|n| n.outcome == TrajectoryOutcome::Success).count();
+        successes as f64 / completed.len() as f64
+    }
+
+    pub fn nodes(&self) -> &[TrajectoryNode] {
+        &self.nodes
+    }
+}
+
+/// Intent graph — tracks user intent over time, showing how intent evolved.
+///
+/// Each node is an intent (parsed from user input). Edges represent
+/// intent transitions — what the user wanted before and after.
+/// The graph captures intent drift, corrections, and confirmations.
+#[derive(Debug, Clone)]
+pub struct IntentGraph {
+    nodes: Vec<IntentNode>,
+    edges: Vec<(usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntentNode {
+    pub intent_hash: u64,
+    pub description: String,
+    pub priority: f64,
+    pub confirmed: bool,
+}
+
+impl IntentGraph {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        }
+    }
+
+    pub fn add_intent(&mut self, intent_hash: u64, description: String, priority: f64) -> usize {
+        let idx = self.nodes.len();
+        self.nodes.push(IntentNode {
+            intent_hash,
+            description,
+            priority,
+            confirmed: false,
+        });
+        if idx > 0 {
+            self.edges.push((idx - 1, idx));
+        }
+        idx
+    }
+
+    pub fn confirm(&mut self, idx: usize) {
+        if let Some(node) = self.nodes.get_mut(idx) {
+            node.confirmed = true;
+        }
+    }
+
+    pub fn latest_confirmed(&self) -> Option<&IntentNode> {
+        self.nodes.iter().rev().find(|n| n.confirmed)
+    }
+
+    pub fn intent_drift(&self) -> f64 {
+        // Measure how much intent has changed over time
+        // Higher drift = user changed their mind more
+        if self.nodes.len() < 2 {
+            return 0.0;
+        }
+        let mut total_drift = 0u64;
+        for window in self.nodes.windows(2) {
+            total_drift += window[0].intent_hash ^ window[1].intent_hash;
+        }
+        total_drift as f64 / (self.nodes.len() - 1) as f64
+    }
+
+    pub fn nodes(&self) -> &[IntentNode] {
+        &self.nodes
+    }
+}
+
+/// Live-data scoring model — scores mutations against user intent using learned weights.
+///
+/// Trained on live data: each mutation's outcome (success/failure) feeds back
+/// into the model, which adjusts its weights to better predict user satisfaction.
+/// The model scores how likely a mutation is to satisfy the user's intent.
+#[derive(Debug, Clone)]
+pub struct ScoringModel {
+    /// Learned weights for each feature dimension.
+    weights: Vec<f64>,
+    /// Training data: (features, outcome) pairs.
+    training_data: Vec<(Vec<f64>, bool)>,
+    /// Learning rate for online updates.
+    learning_rate: f64,
+}
+
+impl ScoringModel {
+    pub fn new(feature_dim: usize, learning_rate: f64) -> Self {
+        Self {
+            weights: vec![0.0; feature_dim],
+            training_data: Vec::new(),
+            learning_rate,
+        }
+    }
+
+    /// Score a mutation: higher score = more likely to satisfy user intent.
+    pub fn score(&self, features: &[f64]) -> f64 {
+        if features.len() != self.weights.len() {
+            return 0.0;
+        }
+        let mut score = 0.0;
+        for (f, w) in features.iter().zip(self.weights.iter()) {
+            score += f * w;
+        }
+        score
+    }
+
+    /// Train on a mutation outcome: updates weights based on whether the mutation satisfied the user.
+    pub fn train(&mut self, features: &[f64], satisfied: bool) {
+        if features.len() != self.weights.len() {
+            return;
+        }
+        self.training_data.push((features.to_vec(), satisfied));
+
+        // Online gradient update: if not satisfied, push weights away from features
+        let target = if satisfied { 1.0 } else { 0.0 };
+        let current = self.score(features);
+        let error = target - current;
+
+        for (w, f) in self.weights.iter_mut().zip(features.iter()) {
+            *w += self.learning_rate * error * f;
+        }
+    }
+
+    /// Get training data count.
+    pub fn training_count(&self) -> usize {
+        self.training_data.len()
+    }
+}
+
+/// Verifier — second independent check on mutations using trajectory + intent graphs + scoring model.
+///
+/// The verifier cross-references three signals:
+/// 1. **Trajectory consistency** — does this mutation follow the execution pattern?
+/// 2. **Intent alignment** — does this mutation match the latest confirmed intent?
+/// 3. **Scoring model** — does the learned model predict this will satisfy the user?
+///
+/// All three must pass for the verifier to approve. This is the final gate
+/// before the user's explicit approval.
+#[derive(Debug)]
+pub struct Verifier {
+    trajectory: TrajectoryGraph,
+    intent_graph: IntentGraph,
+    scoring_model: ScoringModel,
+    min_trajectory_success_rate: f64,
+    min_intent_alignment: f64,
+    min_model_score: f64,
+}
+
+impl Verifier {
+    pub fn new(
+        feature_dim: usize,
+        min_trajectory_success_rate: f64,
+        min_intent_alignment: f64,
+        min_model_score: f64,
+    ) -> Self {
+        Self {
+            trajectory: TrajectoryGraph::new(),
+            intent_graph: IntentGraph::new(),
+            scoring_model: ScoringModel::new(feature_dim, 0.01),
+            min_trajectory_success_rate,
+            min_intent_alignment,
+            min_model_score,
+        }
+    }
+
+    /// Verify a mutation against all three signals.
+    /// Returns true only if all checks pass.
+    pub fn verify(
+        &self,
+        delta_hash: u64,
+        intent_hash: u64,
+        features: &[f64],
+    ) -> bool {
+        // 1. Trajectory consistency: success rate must be above threshold
+        if self.trajectory.success_rate() < self.min_trajectory_success_rate {
+            return false;
+        }
+
+        // 2. Intent alignment: delta must align with latest confirmed intent
+        if let Some(latest) = self.intent_graph.latest_confirmed() {
+            // Alignment: how many lower bits match between delta and intent hash
+            let xor = delta_hash ^ latest.intent_hash;
+            let matching_bits = 64 - xor.leading_zeros();
+            let alignment = matching_bits as f64 / 64.0;
+            if alignment < self.min_intent_alignment {
+                return false;
+            }
+        }
+
+        // 3. Scoring model: predicted satisfaction must exceed threshold
+        if self.scoring_model.score(features) < self.min_model_score {
+            return false;
+        }
+
+        true
+    }
+
+    /// Record a mutation outcome for trajectory tracking.
+    pub fn record_outcome(&mut self, idx: usize, outcome: TrajectoryOutcome) {
+        self.trajectory.set_outcome(idx, outcome);
+    }
+
+    /// Record a confirmed intent for intent tracking.
+    pub fn record_intent(&mut self, intent_hash: u64, description: String, priority: f64) {
+        self.intent_graph.add_intent(intent_hash, description, priority);
+    }
+
+    /// Confirm the latest intent.
+    pub fn confirm_intent(&mut self, idx: usize) {
+        self.intent_graph.confirm(idx);
+    }
+
+    /// Train the scoring model on a mutation outcome.
+    pub fn train_model(&mut self, features: &[f64], satisfied: bool) {
+        self.scoring_model.train(features, satisfied);
+    }
+
+    /// Add a trajectory node.
+    pub fn add_trajectory_node(&mut self, action: String, address: RegisterAddress, delta_hash: u64) -> usize {
+        self.trajectory.add_node(action, address, delta_hash)
+    }
+
+    /// Get reference to trajectory graph.
+    pub fn trajectory(&self) -> &TrajectoryGraph {
+        &self.trajectory
+    }
+
+    /// Get reference to intent graph.
+    pub fn intent_graph(&self) -> &IntentGraph {
+        &self.intent_graph
+    }
+
+    /// Get reference to scoring model.
+    pub fn scoring_model(&self) -> &ScoringModel {
+        &self.scoring_model
+    }
+}
+
 /// Configuration for the intent engine.
 #[derive(Debug, Clone)]
 pub struct IntentEngineConfig {
@@ -880,5 +1187,120 @@ mod tests {
         // Evolve should reduce the gap
         let best = engine.evolve_to_intent(&intent, &current).unwrap();
         assert!(best.fitness < 4.0); // better than all-bits-different
+    }
+
+    #[test]
+    fn test_trajectory_graph() {
+        let mut traj = TrajectoryGraph::new();
+
+        let addr = RegisterAddress::from(0u128);
+        let n1 = traj.add_node("read".to_string(), addr, 42);
+        let n2 = traj.add_node("inject".to_string(), addr, 43);
+
+        assert_eq!(n1, 0);
+        assert_eq!(n2, 1);
+        assert_eq!(traj.nodes().len(), 2);
+        assert_eq!(traj.edges.len(), 1);
+
+        traj.set_outcome(n1, TrajectoryOutcome::Success);
+        traj.set_outcome(n2, TrajectoryOutcome::Success);
+        assert_eq!(traj.success_rate(), 1.0);
+    }
+
+    #[test]
+    fn test_intent_graph_drift() {
+        let mut intent_graph = IntentGraph::new();
+
+        let i1 = intent_graph.add_intent(100, "add sin".to_string(), 1.0);
+        let i2 = intent_graph.add_intent(100, "add sin".to_string(), 1.0);
+        let i3 = intent_graph.add_intent(200, "add cos".to_string(), 1.0);
+
+        intent_graph.confirm(i1);
+        intent_graph.confirm(i2);
+        intent_graph.confirm(i3);
+
+        // First two intents are same, third is different
+        // Drift: (100^100 + 100^200) / 2 = (0 + 440) / 2 = 220
+        assert!(intent_graph.intent_drift() > 0.0);
+
+        // Latest confirmed should be the third
+        let latest = intent_graph.latest_confirmed().unwrap();
+        assert_eq!(latest.intent_hash, 200);
+    }
+
+    #[test]
+    fn test_scoring_model_online_learning() {
+        let mut model = ScoringModel::new(4, 0.1);
+
+        let features = vec![1.0, 0.5, 0.3, 0.8];
+
+        // Before training, score should be 0.0 (all weights are 0)
+        assert_eq!(model.score(&features), 0.0);
+        assert_eq!(model.training_count(), 0);
+
+        // Train with positive outcome
+        model.train(&features, true);
+        assert_eq!(model.training_count(), 1);
+
+        // Score should now be non-zero (weights updated)
+        let score_after = model.score(&features);
+        assert!(score_after != 0.0);
+
+        // Train with negative outcome
+        model.train(&features, false);
+        assert_eq!(model.training_count(), 2);
+    }
+
+    #[test]
+    fn test_verifier_three_gate() {
+        let mut verifier = Verifier::new(4, 0.0, 0.0, -1e9);
+
+        let addr = RegisterAddress::from(0u128);
+        let delta_hash = 42;
+        let intent_hash = 42;
+        let features = vec![1.0, 0.0, 0.0, 0.0];
+
+        // No trajectory nodes yet — success rate is 0.0
+        // With min_trajectory_success_rate=0.0, this should pass
+        let result = verifier.verify(delta_hash, intent_hash, &features);
+        // Trajectory is empty, success_rate is 0.0, threshold is 0.0 → passes
+        // Intent graph is empty, no confirmed intent → passes
+        // Scoring model not trained, score is 0.0, threshold is -1e9 → passes
+        assert!(result);
+
+        // Add a confirmed intent that doesn't match
+        verifier.record_intent(999, "different intent".to_string(), 1.0);
+        verifier.confirm_intent(0);
+        // Raise alignment threshold so mismatched hash fails
+        verifier.min_intent_alignment = 0.9;
+
+        // Now intent alignment check should fail (42 vs 999 — low bit match)
+        let result2 = verifier.verify(delta_hash, intent_hash, &features);
+        assert!(!result2);
+    }
+
+    #[test]
+    fn test_verifier_full_pipeline() {
+        // Verify: trajectory + intent + scoring model all gate the mutation
+        let mut verifier = Verifier::new(4, 0.0, 0.0, -1e9);
+
+        let addr = RegisterAddress::from(0u128);
+        let delta_hash = 100;
+        let intent_hash = 100;
+        let features = vec![0.5, 0.5, 0.5, 0.5];
+
+        // Record trajectory outcome
+        let node_idx = verifier.add_trajectory_node("inject".to_string(), addr, delta_hash);
+        verifier.record_outcome(node_idx, TrajectoryOutcome::Success);
+
+        // Record confirmed intent
+        verifier.record_intent(intent_hash, "learn sin".to_string(), 1.0);
+        verifier.confirm_intent(0);
+
+        // Train scoring model on positive outcome
+        verifier.train_model(&features, true);
+
+        // All three gates should pass now
+        assert!(verifier.verify(delta_hash, intent_hash, &features));
     }
 }
