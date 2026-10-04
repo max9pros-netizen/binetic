@@ -1,0 +1,13 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# llama.cpp / MLX backend sources (re-clone with:
+#   git clone --depth 1 https://github.com/ggerganov/llama.cpp backends/llama-cpp
+#   git clone --depth 1 https://github.com/ml-explore/mlx backends/mlx
+/backends/llama-cpp
+/backends/mlx
+
+# OS
+.DS_Store

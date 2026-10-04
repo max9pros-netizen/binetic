@@ -1,0 +1,13 @@
+[package]
+name = "binetic-mlx"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+binetic-core = { path = "../binetic-core" }
+thiserror = "1"
+tracing = "0.1"
+once_cell = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mlx-rs = "0.32"
