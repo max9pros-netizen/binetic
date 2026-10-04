@@ -1,0 +1,16 @@
+[package]
+name = "temporal-packet-network"
+version = "0.1.0"
+edition = "2021"
+authors = ["Temporal Packet Network Architect"]
+description = "Deterministic Discrete-Event Temporal Packet Network & UTM Engine"
+
+[dependencies]
+sha2 = "0.10.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+hex = "0.4.3"
+
+[dev-dependencies]
+proptest = "1.4.0"

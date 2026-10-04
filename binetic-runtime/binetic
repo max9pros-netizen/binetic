@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""binetic — the temporal computing runtime.
+
+Declarative interface: write a .tpn protocol, run it in any mode.
+
+Usage:
+    binetic simulate network.tpn [-p PACKET...]  # execute packets
+    binetic synth network.tpn [-o OUTDIR]        # synthesize hardware
+    binetic deploy network.tpn [-p PACKET...]    # compile + execute + synthesize + verify
+"""
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Prefer the package; fall back to the plain module import.
+try:
+    from binetic_runtime import main
+except ImportError:
+    from cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

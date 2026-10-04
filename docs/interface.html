@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>binetic — Temporal Computing Interface</title>
+<style>
+  :root {
+    --bg: #0b1120;
+    --fg: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #10b981;
+    --accent-2: #38bdf8;
+    --accent-3: #a78bfa;
+    --border: #1e293b;
+    --card: #12182b;
+    --red: #ef4444;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--fg);
+    padding: 24px;
+    line-height: 1.55;
+  }
+  h1 { font-size: 26px; margin-bottom: 6px; background: linear-gradient(135deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; background: #1e293b; color: var(--accent); border: 1px solid var(--accent); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .panel { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .panel h2 { font-size: 15px; color: var(--accent-2); margin-bottom: 12px; }
+  .layer { display: flex; align-items: center; gap: 10px; padding: 10px 14px; margin: 6px 0; background: #161e32; border-radius: 8px; border-left: 3px solid var(--accent); transition: transform 0.15s; }
+  .layer:hover { transform: translateX(4px); }
+  .layer .name { font-weight: 600; font-size: 14px; flex: 1; }
+  .layer .desc { font-size: 11px; color: var(--muted); flex: 2; }
+  .layer .key { font-size: 10px; color: var(--accent-3); font-family: monospace; }
+  .arrow { text-align: center; color: var(--muted); font-size: 16px; }
+  .code { font-family: "SF Mono", "Fira Code", monospace; font-size: 12px; background: #080c18; border: 1px solid var(--border); border-radius: 8px; padding: 14px; overflow-x: auto; }
+  .code .prompt { color: var(--accent); }
+  .code .comment { color: var(--muted); }
+  .code .string { color: var(--accent-2); }
+  .modes { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+  .mode { flex: 1; min-width: 110px; padding: 10px; text-align: center; border-radius: 8px; border: 1px solid var(--border); background: #161e32; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+  .mode.sim { border-color: var(--accent); color: var(--accent); }
+  .mode.syn { border-color: var(--accent-3); color: var(--accent-3); }
+  .mode.dep { border-color: var(--accent-2); color: var(--accent-2); }
+  .mode:hover { transform: translateY(-2px); }
+  .mode.sim.active, .mode.syn.active, .mode.dep.active { background: var(--accent); color: #000; }
+  .output { font-family: monospace; font-size: 11px; background: #080c18; border-radius: 6px; padding: 10px; margin-top: 8px; white-space: pre; color: #cbd5e1; border: 1px solid var(--border); }
+  .key-figures { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 12px; }
+  .kf { text-align: center; padding: 12px; background: #161e32; border-radius: 8px; border: 1px solid var(--border); }
+  .kf .num { font-size: 22px; font-weight: 700; color: var(--accent); }
+  .kf .label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .novelty { background: linear-gradient(135deg, rgba(16,185,129,0.1), rgba(56,189,248,0.1)); border: 1px solid var(--accent); }
+  .novelty .num { color: var(--accent-2); }
+  pre { margin: 0; }
+</style>
+</head>
+<body>
+<h1>binetic — Temporal Computing Runtime</h1>
+<div class="subtitle">A clean declarative interface over the integrated TPN · bitsliced phased processor · self-hosting synthesis · FPGA network stack. <span class="tag">time as primitive · not quantum</span></div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Integrated Stack</h2>
+    <div class="layer">
+      <span class="name">Temporal AI layer</span>
+      <span class="desc">Neural networks are the protocol: weights = phase delays, activation = trig gate, learning = phase evolution</span>
+      <span class="key">neuron = IP register</span>
+    </div>
+    <div class="arrow">▼</div>
+    <div class="layer">
+      <span class="name">Temporal Packet Network (TPN v2.0)</span>
+      <span class="desc">Trig temporal gate (sin(2θ) — spec's cos² was wrong: 0.5 vs 0 at boundaries), 3× bit-plane error correction, trig softmax attention</span>
+      <span class="key">arrival = execution</span>
+    </div>
+    <div class="arrow">▼</div>
+    <div class="layer">
+      <span class="name">Register = Packet ISA</span>
+      <span class="desc">U256 layout [id:32 | phase:64 | angle:64 | data:64] IS the TPA-fpga packet [id:128 | phase:32 | angle:32 | value:64]</span>
+      <span class="key">IPv4=phase · IPv6=id</span>
+    </div>
+    <div class="arrow">▼</div>
+    <div class="layer">
+      <span class="name">4-wire Phase Processor</span>
+      <span class="desc">Trig→Gate→Adder→Carry→Phase: fitness gates bit-planes, carry propagates through phases, phase selects active bit-plane</span>
+      <span class="key">4 connections</span>
+    </div>
+    <div class="arrow">▼</div>
+    <div class="layer">
+      <span class="name">Self-Hosting Synthesis</span>
+      <span class="desc">Each IPv4/IPv6 address IS a computer; the protocol synthesizes its own hardware from gate definitions — zero external compute</span>
+      <span class="key">256 IPs → 2048 LUTs/256 BRAMs/1024 DSPs</span>
+    </div>
+    <div class="arrow">▼</div>
+    <div class="layer novelty">
+      <span class="name">FPGA Network Stack (fpga-network-stack)</span>
+      <span class="desc">Production-grade TCP/IP · RoCEv2 · UDP/IP at 10–100Gbit/s on Xilinx VC709/VCU118/ADM-PCIE-7V3 — communication IS computation</span>
+      <span class="key">10–100 Gbit/s</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Declarative Interface</h2>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:8px">Write the protocol once in the .tpn DSL. Run it anywhere.</p>
+    <div class="code">
+<span class="comment"># network.tpn — declare the protocol</span>
+protocol version 2 {
+  <span class="string">neuron</span> 0x20010DB8000000000000000000000001 phase <span class="string">500</span> {
+    threshold 0.43
+    isa {
+      gate <span class="string">0</span> { window <span class="string">0..100</span> theta <span class="string">0.0..1.57</span> threshold 0.43 route <span class="string">0</span> }
+      gate <span class="string">1</span> { window <span class="string">100..200</span> theta <span class="string">1.57..3.14</span> threshold 0.43 route <span class="string">1</span> }
+    }
+  }
+  synapse 0x...001 -> 0x...002 delay 50.0
+  mode simulate
+}
+    </div>
+
+    <p style="font-size:12px;color:var(--muted);margin-top:12px;margin-bottom:8px">One declaration, three modes — all three compile the same file:</p>
+    <div class="modes">
+      <div class="mode sim" onclick="runDemo('sim')">simulate</div>
+      <div class="mode syn" onclick="runDemo('syn')">synth</div>
+      <div class="mode dep" onclick="runDemo('dep')">deploy</div>
+    </div>
+    <div id="demoOutput" class="output">
+$ ./binetic simulate /tmp/tpn/example.tpn -p 0x...001,50,10 -p 0x...002,55,20
+[simulate] Protocol(mode='simulate', registers=2, luts=48, brams=2, dsps=12)
+[simulate] loaded /tmp/tpn/example.tpn, 2 registers, 3 gates
+[simulate] sending 2 packet(s)...
+    arrive 0x20010db8000000000000000000000001 arrival=50 value=10 result=0xa verified=True
+    arrive 0x20010db8000000000000000000000002 arrival=55 value=20 result=0x14 verified=True
+[simulate] 2 packets processed, verified=True
+    </div>
+
+    <div class="key-figures">
+      <div class="kf novelty">
+        <div class="num">sin(2θ)</div>
+        <div class="label">corrected gate fitness (spec's cos² → 0.5 wrong)</div>
+      </div>
+      <div class="kf">
+        <div class="num">3×</div>
+        <div class="label">bit-plane error correction</div>
+      </div>
+      <div class="kf">
+        <div class="num">256</div>
+        <div class="label">IPs → 256 computers</div>
+      </div>
+      <div class="kf">
+        <div class="num">100G</div>
+        <div class="label">production FPGA throughput</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function runDemo(mode) {
+  const out = document.getElementById('demoOutput');
+  const modes = document.querySelectorAll('.mode');
+  modes.forEach(m => m.classList.remove('active'));
+  document.querySelector('.mode.' + mode).classList.add('active');
+
+  const outputs = {
+    sim: `$ ./binetic simulate /tmp/tpn/example.tpn -p 0x20010db8000000000000000000000001,50,10 -p 0x20010db8000000000000000000000002,55,20
+[simulate] Protocol(mode='simulate', registers=2, luts=48, brams=2, dsps=12)
+[simulate] loaded /tmp/tpn/example.tpn, 2 registers, 3 gates
+[simulate] sending 2 packet(s)...
+    arrive 0x20010db8000000000000000000000001 arrival=50 value=10 result=0xa verified=True
+    arrive 0x20010db8000000000000000000000002 arrival=55 value=20 result=0x14 verified=True
+[simulate] 2 packets processed, verified=True`,
+    syn: `$ ./binetic synth /tmp/tpn/example.tpn -o /tmp/tpn/out
+[synth] Protocol(mode='simulate', registers=2, luts=48, brams=2, dsps=12)
+[synth] -> /tmp/tpn/out
+        48 LUTs  2 BRAMs  12 DSPs
+        HLS: /tmp/tpn/out/tpn_top.hls
+        XDC: /tmp/tpn/out/constraints.xdc
+[synth] density on Xilinx U55C: LUT 0.0% · BRAM 0.0% · DSP 0.1% (Xilinx U55C estimate)`,
+    dep: `$ ./binetic deploy /tmp/tpn/example.tpn -p 0x20010db8000000000000000000000001,50,10 -p 0x20010db8000000000000000000000002,55,20
+[deploy] compiled: 2 registers, 3 gates
+[deploy] executed 2 packets, verified=True
+[deploy] synthesized: 48 LUTs, 2 BRAMs, 12 DSPs
+[deploy] receipts written: /tmp/tpn/deploy_receipts.json
+[deploy] deploy complete — protocol IS the computer`
+  };
+  out.textContent = outputs[mode];
+}
+</script>
+</body>
+</html>
